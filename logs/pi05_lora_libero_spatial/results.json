@@ -1,0 +1,1014 @@
+{
+  "checkpoint": "/mnt/data/lcx1/yiqinworkspace/openpi/asset_pi05_base/pytorch/model.safetensors",
+  "task_suite": "libero_spatial",
+  "completed_episodes": 100,
+  "successful_episodes": 0,
+  "success_rate": 0.0,
+  "success_rate_percent": 0.0,
+  "approx_95_percent_ci_percent": [
+    0.0,
+    0.0
+  ],
+  "tasks": [
+    {
+      "task_suite": "libero_spatial",
+      "task_id": 0,
+      "completed_episodes": 10,
+      "successful_episodes": 0,
+      "success_rate": 0.0,
+      "success_rate_percent": 0.0,
+      "episodes": [
+        {
+          "episode": 0,
+          "init_state_index": 0,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 13.9095,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 1,
+          "init_state_index": 1,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 13.2353,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 2,
+          "init_state_index": 2,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 12.5837,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 3,
+          "init_state_index": 3,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 12.5549,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 4,
+          "init_state_index": 4,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 12.9094,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 5,
+          "init_state_index": 5,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 13.0035,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 6,
+          "init_state_index": 6,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 13.1805,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 7,
+          "init_state_index": 7,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 12.9514,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 8,
+          "init_state_index": 8,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 12.9857,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 9,
+          "init_state_index": 9,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 13.2568,
+          "termination_reason": "max_env_steps",
+          "success": false
+        }
+      ]
+    },
+    {
+      "task_suite": "libero_spatial",
+      "task_id": 1,
+      "completed_episodes": 10,
+      "successful_episodes": 0,
+      "success_rate": 0.0,
+      "success_rate_percent": 0.0,
+      "episodes": [
+        {
+          "episode": 0,
+          "init_state_index": 0,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 13.0672,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 1,
+          "init_state_index": 1,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 12.9828,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 2,
+          "init_state_index": 2,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 13.394,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 3,
+          "init_state_index": 3,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 13.1173,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 4,
+          "init_state_index": 4,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 12.9105,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 5,
+          "init_state_index": 5,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 13.1111,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 6,
+          "init_state_index": 6,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 13.0309,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 7,
+          "init_state_index": 7,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 12.9476,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 8,
+          "init_state_index": 8,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 13.0073,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 9,
+          "init_state_index": 9,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 13.066,
+          "termination_reason": "max_env_steps",
+          "success": false
+        }
+      ]
+    },
+    {
+      "task_suite": "libero_spatial",
+      "task_id": 2,
+      "completed_episodes": 10,
+      "successful_episodes": 0,
+      "success_rate": 0.0,
+      "success_rate_percent": 0.0,
+      "episodes": [
+        {
+          "episode": 0,
+          "init_state_index": 0,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 12.8913,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 1,
+          "init_state_index": 1,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 13.0414,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 2,
+          "init_state_index": 2,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 13.405,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 3,
+          "init_state_index": 3,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 13.0566,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 4,
+          "init_state_index": 4,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 13.0419,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 5,
+          "init_state_index": 5,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 13.3896,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 6,
+          "init_state_index": 6,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 12.5866,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 7,
+          "init_state_index": 7,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 13.0895,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 8,
+          "init_state_index": 8,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 13.1328,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 9,
+          "init_state_index": 9,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 12.9898,
+          "termination_reason": "max_env_steps",
+          "success": false
+        }
+      ]
+    },
+    {
+      "task_suite": "libero_spatial",
+      "task_id": 3,
+      "completed_episodes": 10,
+      "successful_episodes": 0,
+      "success_rate": 0.0,
+      "success_rate_percent": 0.0,
+      "episodes": [
+        {
+          "episode": 0,
+          "init_state_index": 0,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 13.1375,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 1,
+          "init_state_index": 1,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 13.0086,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 2,
+          "init_state_index": 2,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 13.0838,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 3,
+          "init_state_index": 3,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 13.0794,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 4,
+          "init_state_index": 4,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 13.0762,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 5,
+          "init_state_index": 5,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 13.0703,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 6,
+          "init_state_index": 6,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 13.3702,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 7,
+          "init_state_index": 7,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 13.234,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 8,
+          "init_state_index": 8,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 13.7553,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 9,
+          "init_state_index": 9,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 13.082,
+          "termination_reason": "max_env_steps",
+          "success": false
+        }
+      ]
+    },
+    {
+      "task_suite": "libero_spatial",
+      "task_id": 4,
+      "completed_episodes": 10,
+      "successful_episodes": 0,
+      "success_rate": 0.0,
+      "success_rate_percent": 0.0,
+      "episodes": [
+        {
+          "episode": 0,
+          "init_state_index": 0,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 13.282,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 1,
+          "init_state_index": 1,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 13.1396,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 2,
+          "init_state_index": 2,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 13.0017,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 3,
+          "init_state_index": 3,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 13.4791,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 4,
+          "init_state_index": 4,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 13.2335,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 5,
+          "init_state_index": 5,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 13.2675,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 6,
+          "init_state_index": 6,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 13.1626,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 7,
+          "init_state_index": 7,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 13.2794,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 8,
+          "init_state_index": 8,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 13.0775,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 9,
+          "init_state_index": 9,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 12.6251,
+          "termination_reason": "max_env_steps",
+          "success": false
+        }
+      ]
+    },
+    {
+      "task_suite": "libero_spatial",
+      "task_id": 5,
+      "completed_episodes": 10,
+      "successful_episodes": 0,
+      "success_rate": 0.0,
+      "success_rate_percent": 0.0,
+      "episodes": [
+        {
+          "episode": 0,
+          "init_state_index": 0,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 12.9514,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 1,
+          "init_state_index": 1,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 12.9473,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 2,
+          "init_state_index": 2,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 12.9197,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 3,
+          "init_state_index": 3,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 12.8671,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 4,
+          "init_state_index": 4,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 12.9532,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 5,
+          "init_state_index": 5,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 12.9177,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 6,
+          "init_state_index": 6,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 13.0112,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 7,
+          "init_state_index": 7,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 12.8872,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 8,
+          "init_state_index": 8,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 13.1078,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 9,
+          "init_state_index": 9,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 12.8672,
+          "termination_reason": "max_env_steps",
+          "success": false
+        }
+      ]
+    },
+    {
+      "task_suite": "libero_spatial",
+      "task_id": 6,
+      "completed_episodes": 10,
+      "successful_episodes": 0,
+      "success_rate": 0.0,
+      "success_rate_percent": 0.0,
+      "episodes": [
+        {
+          "episode": 0,
+          "init_state_index": 0,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 12.684,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 1,
+          "init_state_index": 1,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 13.0403,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 2,
+          "init_state_index": 2,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 12.8531,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 3,
+          "init_state_index": 3,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 12.9019,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 4,
+          "init_state_index": 4,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 12.7481,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 5,
+          "init_state_index": 5,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 12.8075,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 6,
+          "init_state_index": 6,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 12.6531,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 7,
+          "init_state_index": 7,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 12.7957,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 8,
+          "init_state_index": 8,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 13.0114,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 9,
+          "init_state_index": 9,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 12.7609,
+          "termination_reason": "max_env_steps",
+          "success": false
+        }
+      ]
+    },
+    {
+      "task_suite": "libero_spatial",
+      "task_id": 7,
+      "completed_episodes": 10,
+      "successful_episodes": 0,
+      "success_rate": 0.0,
+      "success_rate_percent": 0.0,
+      "episodes": [
+        {
+          "episode": 0,
+          "init_state_index": 0,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 12.9663,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 1,
+          "init_state_index": 1,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 12.9351,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 2,
+          "init_state_index": 2,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 12.4529,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 3,
+          "init_state_index": 3,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 12.811,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 4,
+          "init_state_index": 4,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 13.3522,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 5,
+          "init_state_index": 5,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 13.0026,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 6,
+          "init_state_index": 6,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 12.8432,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 7,
+          "init_state_index": 7,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 12.8407,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 8,
+          "init_state_index": 8,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 12.928,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 9,
+          "init_state_index": 9,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 12.9946,
+          "termination_reason": "max_env_steps",
+          "success": false
+        }
+      ]
+    },
+    {
+      "task_suite": "libero_spatial",
+      "task_id": 8,
+      "completed_episodes": 10,
+      "successful_episodes": 0,
+      "success_rate": 0.0,
+      "success_rate_percent": 0.0,
+      "episodes": [
+        {
+          "episode": 0,
+          "init_state_index": 0,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 12.9606,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 1,
+          "init_state_index": 1,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 12.8053,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 2,
+          "init_state_index": 2,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 13.203,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 3,
+          "init_state_index": 3,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 13.1086,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 4,
+          "init_state_index": 4,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 12.8255,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 5,
+          "init_state_index": 5,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 12.8616,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 6,
+          "init_state_index": 6,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 12.8558,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 7,
+          "init_state_index": 7,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 12.8314,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 8,
+          "init_state_index": 8,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 12.8809,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 9,
+          "init_state_index": 9,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 12.802,
+          "termination_reason": "max_env_steps",
+          "success": false
+        }
+      ]
+    },
+    {
+      "task_suite": "libero_spatial",
+      "task_id": 9,
+      "completed_episodes": 10,
+      "successful_episodes": 0,
+      "success_rate": 0.0,
+      "success_rate_percent": 0.0,
+      "episodes": [
+        {
+          "episode": 0,
+          "init_state_index": 0,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 13.0193,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 1,
+          "init_state_index": 1,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 13.1552,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 2,
+          "init_state_index": 2,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 12.8001,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 3,
+          "init_state_index": 3,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 12.7872,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 4,
+          "init_state_index": 4,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 13.1242,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 5,
+          "init_state_index": 5,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 12.868,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 6,
+          "init_state_index": 6,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 12.9218,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 7,
+          "init_state_index": 7,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 12.9694,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 8,
+          "init_state_index": 8,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 12.7019,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 9,
+          "init_state_index": 9,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 12.7992,
+          "termination_reason": "max_env_steps",
+          "success": false
+        }
+      ]
+    }
+  ]
+}

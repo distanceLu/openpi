@@ -1,0 +1,33 @@
+{
+  "checkpoint": "/mnt/data/lcx1/yiqinworkspace/openpi/asset_pi05_base/pytorch/model.safetensors",
+  "task_suite": "libero_spatial",
+  "completed_episodes": 1,
+  "successful_episodes": 0,
+  "success_rate": 0.0,
+  "success_rate_percent": 0.0,
+  "approx_95_percent_ci_percent": [
+    0.0,
+    0.0
+  ],
+  "tasks": [
+    {
+      "task_suite": "libero_spatial",
+      "task_id": 0,
+      "completed_episodes": 1,
+      "successful_episodes": 0,
+      "success_rate": 0.0,
+      "success_rate_percent": 0.0,
+      "episodes": [
+        {
+          "episode": 0,
+          "init_state_index": 0,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 14.7079,
+          "termination_reason": "max_env_steps",
+          "success": false
+        }
+      ]
+    }
+  ]
+}

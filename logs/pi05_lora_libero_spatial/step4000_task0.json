@@ -1,0 +1,114 @@
+{
+  "checkpoint": "/mnt/data/lcx1/yiqinworkspace/openpi/asset_pi05_base/pytorch/model.safetensors",
+  "task_suite": "libero_spatial",
+  "completed_episodes": 10,
+  "successful_episodes": 3,
+  "success_rate": 0.3,
+  "success_rate_percent": 30.0,
+  "approx_95_percent_ci_percent": [
+    1.5969015774687012,
+    58.40309842253129
+  ],
+  "tasks": [
+    {
+      "task_suite": "libero_spatial",
+      "task_id": 0,
+      "completed_episodes": 10,
+      "successful_episodes": 3,
+      "success_rate": 0.3,
+      "success_rate_percent": 30.0,
+      "episodes": [
+        {
+          "episode": 0,
+          "init_state_index": 0,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 18.873,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 1,
+          "init_state_index": 1,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 17.5151,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 2,
+          "init_state_index": 2,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 17.1253,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 3,
+          "init_state_index": 3,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 17.2456,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 4,
+          "init_state_index": 4,
+          "env_steps": 84,
+          "policy_calls": 17,
+          "elapsed_seconds": 15.7084,
+          "termination_reason": "success",
+          "success": true
+        },
+        {
+          "episode": 5,
+          "init_state_index": 5,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 17.6539,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 6,
+          "init_state_index": 6,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 17.969,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 7,
+          "init_state_index": 7,
+          "env_steps": 100,
+          "policy_calls": 20,
+          "elapsed_seconds": 17.5188,
+          "termination_reason": "max_env_steps",
+          "success": false
+        },
+        {
+          "episode": 8,
+          "init_state_index": 8,
+          "env_steps": 82,
+          "policy_calls": 17,
+          "elapsed_seconds": 14.822,
+          "termination_reason": "success",
+          "success": true
+        },
+        {
+          "episode": 9,
+          "init_state_index": 9,
+          "env_steps": 88,
+          "policy_calls": 18,
+          "elapsed_seconds": 15.4475,
+          "termination_reason": "success",
+          "success": true
+        }
+      ]
+    }
+  ]
+}
