@@ -13,6 +13,7 @@ import jax.experimental
 import jax.numpy as jnp
 import numpy as np
 import optax
+from torch.utils.tensorboard import SummaryWriter
 import tqdm_loggable.auto as tqdm
 import wandb
 
@@ -68,6 +69,37 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = 
 
     if log_code:
         wandb.run.log_code(epath.Path(__file__).parent.parent)
+
+
+def init_tensorboard(config: _config.TrainConfig) -> SummaryWriter | None:
+    if not config.tensorboard_enabled:
+        return None
+
+    log_dir = config.tensorboard_log_dir or (config.checkpoint_dir / "tensorboard")
+    writer = SummaryWriter(log_dir=str(log_dir))
+    writer.add_text("config/name", config.name, 0)
+    writer.add_text("config/exp_name", config.exp_name, 0)
+    logging.info("TensorBoard logs will be written to %s", log_dir)
+    return writer
+
+
+def _write_tensorboard_scalars(writer: SummaryWriter | None, metrics: dict[str, Any], step: int) -> None:
+    if writer is None:
+        return
+    for key, value in metrics.items():
+        writer.add_scalar(key, float(np.asarray(value)), step)
+    writer.flush()
+
+
+def _write_tensorboard_images(writer: SummaryWriter | None, batch: tuple[_model.Observation, _model.Actions]) -> None:
+    if writer is None:
+        return
+    for camera_name, images in batch[0].images.items():
+        camera_images = np.asarray(images[: min(5, len(images))])
+        if camera_images.ndim != 4:
+            continue
+        writer.add_images(f"camera_views/{camera_name}", camera_images, 0, dataformats="NHWC")
+    writer.flush()
 
 
 def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shape: at.Params) -> at.Params:
@@ -216,6 +248,7 @@ def main(config: _config.TrainConfig):
         resume=config.resume,
     )
     init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
+    tensorboard_writer = init_tensorboard(config)
 
     data_loader = _data_loader.create_data_loader(
         config,
@@ -232,6 +265,7 @@ def main(config: _config.TrainConfig):
         for i in range(min(5, len(next(iter(batch[0].images.values())))))
     ]
     wandb.log({"camera_views": images_to_log}, step=0)
+    _write_tensorboard_images(tensorboard_writer, batch)
 
     train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
     jax.block_until_ready(train_state)
@@ -266,6 +300,7 @@ def main(config: _config.TrainConfig):
             info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
             pbar.write(f"Step {step}: {info_str}")
             wandb.log(reduced_info, step=step)
+            _write_tensorboard_scalars(tensorboard_writer, reduced_info, step)
             infos = []
         batch = next(data_iter)
 
@@ -274,6 +309,8 @@ def main(config: _config.TrainConfig):
 
     logging.info("Waiting for checkpoint manager to finish")
     checkpoint_manager.wait_until_finished()
+    if tensorboard_writer is not None:
+        tensorboard_writer.close()
 
 
 if __name__ == "__main__":

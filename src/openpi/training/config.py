@@ -525,6 +525,11 @@ class TrainConfig:
     # If true, will enable wandb logging.
     wandb_enabled: bool = True
 
+    # If true, will write TensorBoard events under checkpoint_dir/tensorboard by default.
+    tensorboard_enabled: bool = True
+    # Optional TensorBoard log directory. If unset, uses checkpoint_dir/tensorboard.
+    tensorboard_log_dir: str | None = None
+
     # Used to pass metadata to the policy server.
     policy_metadata: dict[str, Any] | None = None
 

@@ -4,9 +4,12 @@ import re
 from typing import Protocol, TypeAlias, TypeVar, runtime_checkable
 
 import flax.traverse_util as traverse_util
-import jax
 import numpy as np
-from openpi_client import image_tools
+
+try:
+    from openpi_client import image_tools
+except ModuleNotFoundError:  # pragma: no cover
+    image_tools = None
 
 from openpi.models import tokenizer as _tokenizer
 from openpi.shared import array_typing as at
@@ -98,7 +101,17 @@ class RepackTransform(DataTransformFn):
 
     def __call__(self, data: DataDict) -> DataDict:
         flat_item = flatten_dict(data)
-        return jax.tree.map(lambda k: flat_item[k], self.structure)
+
+        def repack(value):
+            if isinstance(value, Mapping):
+                return type(value)((key, repack(child)) for key, child in value.items())
+            if isinstance(value, tuple):
+                return tuple(repack(child) for child in value)
+            if isinstance(value, list):
+                return [repack(child) for child in value]
+            return flat_item[value]
+
+        return repack(self.structure)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -187,6 +200,8 @@ class ResizeImages(DataTransformFn):
     width: int
 
     def __call__(self, data: DataDict) -> DataDict:
+        if image_tools is None:
+            raise ModuleNotFoundError("openpi_client.image_tools is required for ResizeImages")
         data["image"] = {k: image_tools.resize_with_pad(v, self.height, self.width) for k, v in data["image"].items()}
         return data
 

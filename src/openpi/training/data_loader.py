@@ -1,4 +1,4 @@
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 import logging
 import multiprocessing
 import os
@@ -17,6 +17,31 @@ from openpi.training.droid_rlds_dataset import DroidRldsDataset
 import openpi.transforms as _transforms
 
 T_co = TypeVar("T_co", covariant=True)
+
+
+def _tree_map(function, tree):
+    """Map nested Python containers without invoking a JAX runtime."""
+    if isinstance(tree, Mapping):
+        return type(tree)((key, _tree_map(function, value)) for key, value in tree.items())
+    if isinstance(tree, tuple):
+        return type(tree)(*(_tree_map(function, value) for value in tree)) if hasattr(tree, "_fields") else tuple(
+            _tree_map(function, value) for value in tree
+        )
+    if isinstance(tree, list):
+        return [_tree_map(function, value) for value in tree]
+    return function(tree)
+
+
+def _tree_map_many(function, trees):
+    first = trees[0]
+    if isinstance(first, Mapping):
+        return type(first)((key, _tree_map_many(function, [tree[key] for tree in trees])) for key in first)
+    if isinstance(first, tuple):
+        values = (_tree_map_many(function, [tree[index] for tree in trees]) for index in range(len(first)))
+        return type(first)(*values) if hasattr(first, "_fields") else tuple(values)
+    if isinstance(first, list):
+        return [_tree_map_many(function, [tree[index] for tree in trees]) for index in range(len(first))]
+    return function(*trees)
 
 
 class Dataset(Protocol[T_co]):
@@ -409,7 +434,10 @@ class TorchDataLoader:
                 execute in the main process.
             seed: The seed to use for shuffling the data.
         """
-        if jax.process_count() > 1:
+        # PyTorch distributed training handles process sharding through its sampler.
+        # Avoid initializing the JAX CUDA backend in each DeepSpeed worker: doing so
+        # reserves additional GPU memory and can fail before model loading begins.
+        if framework == "jax" and jax.process_count() > 1:
             raise NotImplementedError("Data loading with multiple processes is not supported.")
 
         if len(dataset) < local_batch_size:
@@ -465,14 +493,12 @@ class TorchDataLoader:
                 if self._sharding is not None:
                     yield jax.tree.map(lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch)
                 else:
-                    yield jax.tree.map(torch.as_tensor, batch)
+                    yield _tree_map(torch.as_tensor, batch)
 
 
 def _collate_fn(items):
-    """Collate the batch elements into batched numpy arrays."""
-    # Make sure to convert to numpy arrays before stacking since some of the incoming elements
-    # may be JAX arrays.
-    return jax.tree.map(lambda *xs: np.stack([np.asarray(x) for x in xs], axis=0), *items)
+    """Collate nested samples into NumPy batches without initializing JAX."""
+    return _tree_map_many(lambda *xs: np.stack([np.asarray(x) for x in xs], axis=0), items)
 
 
 def _worker_init_fn(worker_id: int) -> None:
