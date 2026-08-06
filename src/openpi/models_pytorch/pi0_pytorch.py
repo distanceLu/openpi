@@ -320,7 +320,9 @@ class PI0Pytorch(nn.Module):
 
     def forward(self, observation, actions, noise=None, time=None) -> Tensor:#forward：训练前向，计算损失
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
-        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=True)
+        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(
+            observation, train=self.training
+        )
         # 2. 无噪声/时间步则自动随机采样
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
