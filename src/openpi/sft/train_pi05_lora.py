@@ -31,7 +31,7 @@ from tqdm.auto import tqdm
 
 from openpi.models.pi0_config import Pi0Config
 from openpi.models_pytorch.pi0_pytorch import PI0Pytorch
-from openpi.sft.libero_hdf5_dataset import LiberoHDF5Dataset
+from openpi.sft.libero_pt_dataset import LiberoPTDataset
 from openpi.training import config as training_config
 from openpi.training import data_loader
 
@@ -50,6 +50,10 @@ class SFTConfig:
     num_workers: int = 4
     validation_fraction: float = 0.1
     validation_batches: int = 100
+    validation_action_batches: int = 10
+    validation_num_denoise_steps: int = 10
+    validation_translation_tolerance: float = 0.15
+    validation_rotation_tolerance: float = 0.08
     early_stopping_patience: int = 5
     early_stopping_min_delta: float = 0.005
     early_stopping_ema_alpha: float = 0.3
@@ -209,10 +213,10 @@ def setup_distributed() -> DistributedContext:
 
 def build_loader(config: SFTConfig, context: DistributedContext):
     if not config.dataset_dir.is_dir():
-        raise FileNotFoundError(f"Local HDF5 dataset directory does not exist: {config.dataset_dir}")
+        raise FileNotFoundError(f"Local PT dataset directory does not exist: {config.dataset_dir}")
     model_config = Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False, dtype="bfloat16")
     data_factory = training_config.LeRobotLiberoDataConfig(
-        repo_id="libero_hdf5",
+        repo_id="libero_pt",
         assets=training_config.AssetsConfig(
             assets_dir=str(config.norm_stats_dir),
             asset_id=config.norm_stats_asset_id,
@@ -225,7 +229,7 @@ def build_loader(config: SFTConfig, context: DistributedContext):
         expected = config.norm_stats_dir / config.norm_stats_asset_id / "norm_stats.json"
         raise FileNotFoundError(f"PI0.5 LIBERO normalization statistics not found at {expected}")
 
-    train_dataset = LiberoHDF5Dataset(
+    train_dataset = LiberoPTDataset(
         config.dataset_dir,
         action_horizon=model_config.action_horizon,
         default_prompt=config.default_prompt,
@@ -233,7 +237,7 @@ def build_loader(config: SFTConfig, context: DistributedContext):
         validation_fraction=config.validation_fraction,
         split_seed=config.seed,
     )
-    val_dataset = LiberoHDF5Dataset(
+    val_dataset = LiberoPTDataset(
         config.dataset_dir,
         action_horizon=model_config.action_horizon,
         default_prompt=config.default_prompt,
@@ -298,23 +302,57 @@ def build_loader(config: SFTConfig, context: DistributedContext):
 
 
 @torch.no_grad()
-def evaluate_loss(model, loader, device: torch.device, context: DistributedContext, max_batches: int) -> float:
+def evaluate_validation(model, loader, device: torch.device, context: DistributedContext, config: SFTConfig) -> dict[str, float]:
+    """Measure loss and deterministic imitation quality on held-out expert chunks."""
     was_training = model.training
     model.eval()
-    total = torch.zeros(2, dtype=torch.float64, device=device)
+    totals = torch.zeros(10, dtype=torch.float64, device=device)
+    action_batches = min(config.validation_action_batches, config.validation_batches)
     for batch_index, (observation, actions) in enumerate(loader):
-        if batch_index >= max_batches:
+        if batch_index >= config.validation_batches:
             break
         observation = move_to_device(observation, device)
-        actions = actions.to(device=device, dtype=torch.float32)
-        loss = model(observation, actions).mean()
-        total[0] += loss.detach().float().item()
-        total[1] += 1
+        actions = actions.to(device=device, dtype=torch.bfloat16)
+        totals[0] += model(observation, actions).mean().detach().float().item()
+        totals[1] += 1
+        if batch_index >= action_batches:
+            continue
+        target = actions.float()
+        predicted = model.sample_actions(
+            device=device,
+            observation=observation,
+            noise=torch.zeros_like(target),
+            num_steps=config.validation_num_denoise_steps,
+        ).float()
+        predicted, target = predicted[..., :7], target[..., :7]
+        absolute_error = (predicted - target).abs()
+        translation_ok = absolute_error[..., :3].amax(dim=(-1, -2)) <= config.validation_translation_tolerance
+        rotation_ok = absolute_error[..., 3:6].amax(dim=(-1, -2)) <= config.validation_rotation_tolerance
+        gripper_equal = (predicted[..., 6] > 0.0) == (target[..., 6] > 0.0)
+        gripper_ok = gripper_equal.all(dim=-1)
+        chunk_ok = translation_ok & rotation_ok & gripper_ok
+        totals[2] += absolute_error.sum()
+        totals[3] += absolute_error.numel()
+        totals[4] += gripper_equal.sum()
+        totals[5] += gripper_equal.numel()
+        totals[6] += chunk_ok.sum()
+        totals[7] += chunk_ok.numel()
+        totals[8] += translation_ok.sum()
+        totals[9] += rotation_ok.sum()
     if context.enabled:
-        torch.distributed.all_reduce(total, op=torch.distributed.ReduceOp.SUM)
+        torch.distributed.all_reduce(totals, op=torch.distributed.ReduceOp.SUM)
     if was_training:
         model.train()
-    return (total[0] / total[1].clamp_min(1)).item()
+    samples = totals[7].clamp_min(1)
+    return {
+        "validation_loss": (totals[0] / totals[1].clamp_min(1)).item(),
+        "validation_action_mae": (totals[2] / totals[3].clamp_min(1)).item(),
+        "validation_gripper_accuracy": (totals[4] / totals[5].clamp_min(1)).item(),
+        "offline_chunk_success_rate": (totals[6] / samples).item(),
+        "validation_translation_success_rate": (totals[8] / samples).item(),
+        "validation_rotation_success_rate": (totals[9] / samples).item(),
+        "validation_action_samples": totals[7].item(),
+    }
 
 
 def _format_duration(seconds: float) -> str:
@@ -377,8 +415,21 @@ class TrainingMonitor:
         if not context.is_main:
             return
         self.log_dir.mkdir(parents=True, exist_ok=True)
+        metrics_path = self.log_dir / "metrics.json"
+        if config.resume and metrics_path.is_file():
+            for line in metrics_path.read_text().splitlines():
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                row_step = int(row.get("step", 0))
+                if row_step > start_step or "validation_loss" not in row:
+                    continue
+                self.ema_val_loss = float(row["validation_loss_ema"])
+                self.best_val_loss = float(row["best_validation_loss"])
+                self.best_step = int(row["best_step"])
+                self.no_improve_count = int(row.get("no_improve_count", 0))
         self.log_file = (self.log_dir / "train.log").open("a", buffering=1)
-        self.metrics_file = (self.log_dir / "metrics.json").open("a", buffering=1)
+        self.metrics_file = metrics_path.open("a", buffering=1)
         tensorboard_root = config.tensorboard_dir or self.log_dir
         self.writer = SummaryWriter(
             log_dir=str(tensorboard_root / config.tensorboard_run_name),
@@ -452,7 +503,8 @@ class TrainingMonitor:
             if step % self.config.log_interval == 0:
                 self.writer.flush()
 
-    def log_validation(self, step: int, train_loss: float, val_loss: float) -> bool:
+    def log_validation(self, step: int, train_loss: float, validation: dict[str, float]) -> bool:
+        val_loss = validation["validation_loss"]
         alpha = self.config.early_stopping_ema_alpha
         self.ema_val_loss = (
             val_loss if self.ema_val_loss is None
@@ -474,7 +526,7 @@ class TrainingMonitor:
         metrics = {
             "step": step,
             "train_loss_at_checkpoint": train_loss,
-            "validation_loss": val_loss,
+            **validation,
             "validation_loss_ema": self.ema_val_loss,
             "best_validation_loss": self.best_val_loss,
             "best_step": self.best_step,
@@ -491,6 +543,9 @@ class TrainingMonitor:
             f"step {step} | checkpoint evaluation | train_loss {train_loss:.6f} | "
             f"val_loss {val_loss:.6f} | ema_val_loss {self.ema_val_loss:.6f} | "
             f"best_val_loss {self.best_val_loss:.6f} at step {self.best_step} | "
+            f"offline_chunk_success {validation['offline_chunk_success_rate']:.2%} | "
+            f"action_mae {validation['validation_action_mae']:.4f} | "
+            f"gripper_acc {validation['validation_gripper_accuracy']:.2%} | "
             f"no_improve {self.no_improve_count}/{self.config.early_stopping_patience} | "
             f"gap {gap:+.6f} | val/train {ratio:.3f} | patience_warning {patience_warning} | "
             f"hard_stop {hard_stop}"
@@ -508,6 +563,15 @@ class TrainingMonitor:
             self.writer.add_scalar("validation/ema_loss", self.ema_val_loss, step)
             self.writer.add_scalar("validation/best_loss", self.best_val_loss, step)
             self.writer.add_scalar("validation/no_improve_count", self.no_improve_count, step)
+            for key in (
+                "validation_action_mae",
+                "validation_gripper_accuracy",
+                "offline_chunk_success_rate",
+                "validation_translation_success_rate",
+                "validation_rotation_success_rate",
+                "validation_action_samples",
+            ):
+                self.writer.add_scalar(f"validation/{key.removeprefix('validation_')}", validation[key], step)
             self.writer.add_scalar("overfitting/gap", gap, step)
             self.writer.add_scalar("overfitting/validation_train_ratio", ratio, step)
             self.writer.add_scalar("overfitting/warning", float(patience_warning), step)
@@ -561,7 +625,11 @@ def save_checkpoint(engine, config: SFTConfig, context: DistributedContext, step
         if not adapter:
             raise RuntimeError("Refusing to save an empty LoRA adapter")
         safetensors.torch.save_file(adapter, destination / "adapter_model.safetensors")
-        (destination / "adapter_config.json").write_text(json.dumps(_json_config(config), indent=2))
+        saved_config = _json_config(config)
+        saved_config["dataset_format"] = "flat_pt_v1"
+        saved_config["action_alignment"] = "observation_t_to_action_t_plus_1"
+        saved_config["gripper_conversion"] = "stored_0_1_to_libero_minus1_plus1"
+        (destination / "adapter_config.json").write_text(json.dumps(saved_config, indent=2))
         (destination / "trainer_state.json").write_text(json.dumps(client_state, indent=2))
         (config.output_dir / "latest").write_text(tag)
 
@@ -631,10 +699,26 @@ def train(config: SFTConfig) -> None:
 def _train(config: SFTConfig, context: DistributedContext) -> None:
     if config.steps <= 0:
         raise ValueError(f"steps must be positive, got {config.steps}")
-    if config.batch_size <= 0 or config.gradient_accumulation_steps <= 0:
-        raise ValueError("batch_size and gradient_accumulation_steps must be positive")
-    if config.save_interval <= 0 or config.log_interval <= 0:
-        raise ValueError("save_interval and log_interval must be positive")
+    if config.batch_size <= 0 or config.gradient_accumulation_steps <= 0 or config.num_workers < 0:
+        raise ValueError("batch_size and gradient_accumulation_steps must be positive; num_workers must be non-negative")
+    if config.save_interval <= 0 or config.log_interval <= 0 or config.validation_batches <= 0:
+        raise ValueError("save_interval, log_interval, and validation_batches must be positive")
+    if not 0 < config.validation_action_batches <= config.validation_batches:
+        raise ValueError("validation_action_batches must be in [1, validation_batches]")
+    if config.validation_num_denoise_steps <= 0:
+        raise ValueError("validation_num_denoise_steps must be positive")
+    if config.validation_translation_tolerance <= 0 or config.validation_rotation_tolerance <= 0:
+        raise ValueError("validation action tolerances must be positive")
+    if config.save_interval > config.steps:
+        raise ValueError("save_interval must not exceed steps; otherwise no validation checkpoint is guaranteed")
+    if config.warmup_steps < 0 or config.warmup_steps >= config.steps:
+        raise ValueError("warmup_steps must be non-negative and smaller than steps")
+    if not 0.0 < config.min_learning_rate <= config.learning_rate:
+        raise ValueError("learning rates must satisfy 0 < min_learning_rate <= learning_rate")
+    if config.weight_decay < 0 or config.max_grad_norm <= 0:
+        raise ValueError("weight_decay must be non-negative and max_grad_norm must be positive")
+    if not 0.0 <= config.lora_dropout < 1.0 or config.lora_rank <= 0 or config.lora_alpha <= 0:
+        raise ValueError("LoRA rank/alpha must be positive and dropout must be in [0, 1)")
     if config.early_stopping_patience <= 0:
         raise ValueError("early_stopping_patience must be positive")
     if config.early_stopping_min_delta < 0:
@@ -643,6 +727,10 @@ def _train(config: SFTConfig, context: DistributedContext) -> None:
         raise ValueError("early_stopping_ema_alpha must be in (0, 1]")
     if config.hard_stop_ratio <= 0:
         raise ValueError("hard_stop_ratio must be positive")
+    if not 0.0 < config.validation_fraction < 1.0:
+        raise ValueError("validation_fraction must be in (0, 1)")
+    if config.moving_average_window <= 0 or config.monitor_interval <= 0 or config.gpu_util_interval <= 0:
+        raise ValueError("monitor intervals and moving_average_window must be positive")
     if not config.resume and config.output_dir.exists() and any(config.output_dir.iterdir()):
         raise FileExistsError(
             f"Refusing to start a fresh run in non-empty output directory {config.output_dir}. "
@@ -663,7 +751,7 @@ def _train(config: SFTConfig, context: DistributedContext) -> None:
     model_file = _find_model_file(config.initial_checkpoint)
     if model_file.stat().st_size == 0:
         raise ValueError(f"Initial checkpoint is empty: {model_file}. Re-download the safetensors file before training.")
-    logging.info("Building HDF5 data pipeline")
+    logging.info("Building flat PT data pipeline")
     loader, val_loader, model_config = build_loader(config, context)
     logging.info("Creating PI0.5 model on %s", device)
     model = PI0Pytorch(model_config).to(device)
@@ -721,6 +809,8 @@ def _train(config: SFTConfig, context: DistributedContext) -> None:
         dist_init_required=False,
     )
     step = load_resume(model, config)
+    if step >= config.steps:
+        raise ValueError(f"Checkpoint step {step} has already reached requested steps={config.steps}")
     effective_batch_size = config.batch_size * config.gradient_accumulation_steps * context.world_size
     logging.info(
         "Injected LoRA into %d layers; trainable parameters: %s; world_size=%d; per_gpu_batch=%d; "
@@ -728,7 +818,7 @@ def _train(config: SFTConfig, context: DistributedContext) -> None:
         len(replaced), f"{sum(p.numel() for p in trainable):,}", context.world_size, config.batch_size,
         config.gradient_accumulation_steps, effective_batch_size,
     )
-    logging.info("Training loop ready; requesting first HDF5 batch")
+    logging.info("Training loop ready; requesting first PT batch")
     monitor = TrainingMonitor(config, context, step)
     if monitor.writer is not None:
         monitor.writer.add_text("config", json.dumps(_json_config(config), indent=2), step)
@@ -753,7 +843,7 @@ def _train(config: SFTConfig, context: DistributedContext) -> None:
                 running_data += data_done - update_started if micro_steps == 0 else data_done - batch_started
                 batch_index += 1
                 observation = move_to_device(observation, device)
-                actions = actions.to(device=device, dtype=torch.float32)
+                actions = actions.to(device=device, dtype=torch.bfloat16)
                 forward_started = time.perf_counter()
                 losses = model(observation, actions)
                 raw_loss = losses.mean()
@@ -836,8 +926,8 @@ def _train(config: SFTConfig, context: DistributedContext) -> None:
                 micro_steps = 0
                 update_started = time.perf_counter()
                 if step % config.save_interval == 0 or step == config.steps:
-                    val_loss = evaluate_loss(model, val_loader, device, context, config.validation_batches)
-                    hard_stop = monitor.log_validation(step, global_loss, val_loss)
+                    validation = evaluate_validation(model, val_loader, device, context, config)
+                    hard_stop = monitor.log_validation(step, global_loss, validation)
                     if hard_stop:
                         should_stop = True
                     save_checkpoint(model, config, context, step)

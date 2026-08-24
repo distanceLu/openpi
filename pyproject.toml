@@ -14,6 +14,8 @@ dependencies = [
     "flax==0.10.2",
     "fsspec[gcs]>=2024.6.0",
     "gym-aloha>=0.1.1",
+    "h5py>=3.11.0",
+    "imageio-ffmpeg>=0.6.0",
     "imageio>=2.36.1",
     "jax[cuda12]==0.5.3",
     "jaxtyping==0.2.36",
@@ -41,6 +43,8 @@ dependencies = [
     "tensorboard>=2.15.2",
     "gsutil>=5.37",
     "deepspeed>=0.16.5",
+    "uvicorn[standard]>=0.52.1",
+    "fastapi>=0.141.1",
 ]
 
 

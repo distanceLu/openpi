@@ -318,14 +318,26 @@ class PI0Pytorch(nn.Module):
 
         return embs, pad_masks, att_masks, adarms_cond
 
-    def forward(self, observation, actions, noise=None, time=None) -> Tensor:#forward：训练前向，计算损失
-        """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
+    def forward(self, observation, actions, noise=None, time=None, action_mask=None) -> Tensor:#forward：训练前向，计算损失
+        """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)."""
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(
             observation, train=self.training
         )
         # 2. 无噪声/时间步则自动随机采样
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
+        if action_mask is not None:
+            action_mask = torch.as_tensor(
+                action_mask, dtype=actions.dtype, device=actions.device
+            ).reshape(1, 1, -1)
+            if action_mask.shape[-1] != actions.shape[-1]:
+                raise ValueError(
+                    f"action_mask has {action_mask.shape[-1]} dimensions, expected {actions.shape[-1]}"
+                )
+            if not torch.any(action_mask):
+                raise ValueError("action_mask must enable at least one action dimension")
+            actions = actions * action_mask
+            noise = noise * action_mask
 
         if time is None:
             time = self.sample_time(actions.shape[0], actions.device)
@@ -378,17 +390,30 @@ class PI0Pytorch(nn.Module):
             return self.action_out_proj(suffix_out)
 
         v_t = self._apply_checkpoint(action_out_proj_func, suffix_out).to(dtype=torch.float32)
-
-        return F.mse_loss(u_t.to(dtype=torch.float32), v_t, reduction="none")
+        losses = F.mse_loss(u_t.to(dtype=torch.float32), v_t, reduction="none")
+        if action_mask is not None:
+            losses = losses * action_mask.to(dtype=losses.dtype)
+        return losses
 
     @torch.no_grad()
     #推理核心，动作采样入口：sample_actions
-    def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:
+    def sample_actions(self, device, observation, noise=None, num_steps=10, action_mask=None) -> Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
         bsize = observation.state.shape[0]
         if noise is None:
             actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
             noise = self.sample_noise(actions_shape, device)
+        if action_mask is not None:
+            action_mask = torch.as_tensor(
+                action_mask, dtype=noise.dtype, device=device
+            ).reshape(1, 1, -1)
+            if action_mask.shape[-1] != noise.shape[-1]:
+                raise ValueError(
+                    f"action_mask has {action_mask.shape[-1]} dimensions, expected {noise.shape[-1]}"
+                )
+            if not torch.any(action_mask):
+                raise ValueError("action_mask must enable at least one action dimension")
+            noise = noise * action_mask
 
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
         # 1. 编码图像 + 文本前缀（PI0/PI0.5 共用，无分支），前缀编码用于后续图像-文本注意力计算
@@ -426,6 +451,8 @@ class PI0Pytorch(nn.Module):
 
             # Euler step - use new tensor assignment instead of in-place operation
             x_t = x_t + dt * v_t#欧拉更新公式 x_{t-dt} = x_t + dt * v_t
+            if action_mask is not None:
+                x_t = x_t * action_mask
             time += dt
         return x_t# 返回最终去噪后的动作
 

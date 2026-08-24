@@ -1,4 +1,4 @@
-"""Dataset adapter for the flat PT SFT data exported from LIBERO."""
+"""Dataset loader for flat PT episodes exported from LIBERO."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ import torch
 
 _TASK_PATTERN = re.compile(r"(?:^|[_-])task[_-]?(\d+)(?:[_-]|$)", re.IGNORECASE)
 _EPISODE_PATTERN = re.compile(r"(?:^|[_-])ep(?:isode)?[_-]?(\d+)(?:[_-]|$)", re.IGNORECASE)
+_CONTINUOUS_ACTION_FORMAT = "unnormalized_env_delta_frame_aligned_padding_at_0"
 
 
 def _as_numpy(value: Any) -> np.ndarray:
@@ -38,13 +39,8 @@ def _id_from_filename(path: Path, pattern: re.Pattern[str], name: str) -> int:
     return int(match.group(1))
 
 
-class LiberoHDF5Dataset(torch.utils.data.Dataset):
-    """Read flat ``.pt`` episodes and split each task at episode level.
-
-    The historical class name is retained so existing training imports remain
-    compatible. Task IDs come from metadata first, then the PT payload, and only
-    then the filename. No task-directory layout is required.
-    """
+class LiberoPTDataset(torch.utils.data.Dataset):
+    """Read flat ``.pt`` episodes and split each task at episode level."""
 
     def __init__(
         self,
@@ -106,6 +102,13 @@ class LiberoHDF5Dataset(torch.utils.data.Dataset):
             )
             frame_values = entry.get("frame_ids", [])
             frames = [_integer(frame, "frame_id") for frame in frame_values]
+            action_format = entry.get("action_format", {})
+            continuous_format = action_format.get("actions_continuous") if isinstance(action_format, dict) else None
+            if continuous_format != _CONTINUOUS_ACTION_FORMAT:
+                raise ValueError(
+                    f"Unsupported actions_continuous format for {path}: {continuous_format!r}; "
+                    f"expected {_CONTINUOUS_ACTION_FORMAT!r}"
+                )
             record = grouped.setdefault(
                 path,
                 {
@@ -114,11 +117,14 @@ class LiberoHDF5Dataset(torch.utils.data.Dataset):
                     "episode": episode,
                     "instruction": entry.get("instruction"),
                     "valid_frames": _integer(entry.get("valid_frames", 0), "valid_frames"),
+                    "action_format": action_format,
                     "frame_ids": [],
                 },
             )
             if record["task_id"] != task_id or record["episode"] != episode:
                 raise ValueError(f"Inconsistent task/episode metadata for {path}")
+            if record["action_format"] != action_format:
+                raise ValueError(f"Inconsistent action_format metadata for {path}")
             record["frame_ids"].extend(frames)
 
         records = []
@@ -146,7 +152,7 @@ class LiberoHDF5Dataset(torch.utils.data.Dataset):
             task_records = by_task[task_id]
             if len(task_records) < 2:
                 raise ValueError(
-                    f"Task {task_id} has only {len(task_records)} episode; an episode-isolated 90/10 split requires at least 2"
+                    f"Task {task_id} has only {len(task_records)} episode; an episode-isolated split requires at least 2"
                 )
             rng = np.random.default_rng(seed + task_id * 1_000_003)
             order = rng.permutation(len(task_records)).tolist()
@@ -191,21 +197,31 @@ class LiberoHDF5Dataset(torch.utils.data.Dataset):
         video = _as_numpy(episode["video"])
         wrist_video = _as_numpy(episode["wrist_video"])
         state = _as_numpy(episode["proprio"])
-        actions = _as_numpy(episode.get("actions_continuous", episode.get("actions")))
-        if actions.ndim != 2:
-            raise ValueError(f"Expected [T, action_dim] actions in {record['path']}, got {actions.shape}")
-        if not (len(video) == len(wrist_video) == len(state) == len(actions)):
-            raise ValueError(f"Modalities have inconsistent frame counts in {record['path']}")
+        if "actions_continuous" not in episode:
+            raise KeyError(f"PT episode lacks actions_continuous required by its metadata: {record['path']}")
+        actions = _as_numpy(episode["actions_continuous"])
+        if actions.ndim != 2 or actions.shape[1] != 7:
+            raise ValueError(f"Expected [T, 7] continuous actions in {record['path']}, got {actions.shape}")
+        if state.ndim != 2 or state.shape[1] != 8:
+            raise ValueError(f"Expected [T, 8] proprio in {record['path']}, got {state.shape}")
+        if not (len(video) == len(wrist_video) == len(state) == len(actions) == record["valid_frames"]):
+            raise ValueError(f"Modalities or valid_frames are inconsistent in {record['path']}")
+        if not np.isfinite(state).all() or not np.isfinite(actions).all():
+            raise FloatingPointError(f"State/actions contain NaN or Inf in {record['path']}")
 
-        end = min(len(actions), frame + self.action_horizon)
-        action_chunk = np.asarray(actions[frame:end], dtype=np.float32)
+        action_start = min(frame + 1, len(actions) - 1)
+        end = min(len(actions), action_start + self.action_horizon)
+        action_chunk = np.asarray(actions[action_start:end], dtype=np.float32).copy()
         if len(action_chunk) < self.action_horizon:
             padding = np.repeat(action_chunk[-1:], self.action_horizon - len(action_chunk), axis=0)
             action_chunk = np.concatenate((action_chunk, padding), axis=0)
+        action_chunk[..., -1] = 2.0 * action_chunk[..., -1] - 1.0
+        if np.any(action_chunk[..., -1] < -1.01) or np.any(action_chunk[..., -1] > 1.01):
+            raise ValueError(f"Converted gripper actions fall outside [-1, 1] in {record['path']}")
+
         prompt = episode.get("instruction") or record.get("instruction") or self.default_prompt
         if not prompt:
             raise ValueError(f"No language instruction for task {record['task_id']} in {record['path']}")
-
         return {
             "image": np.ascontiguousarray(video[frame]),
             "wrist_image": np.ascontiguousarray(wrist_video[frame]),

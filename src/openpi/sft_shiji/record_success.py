@@ -23,7 +23,11 @@ def _wilson_lower_bound(successes: int, trials: int, z: float = 1.96) -> float:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Record PI0.5 real-robot brush-writing evaluation")
-    parser.add_argument("--output-dir", type=Path, default=Path("/data/yiqinworkspace/openpi/src/openpi/sft_shiji/output"))
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("/mnt/data/lcx1/yiqinworkspace/openpi/src/openpi/sft_shiji/output"),
+    )
     parser.add_argument("--checkpoint", required=True, help="Checkpoint folder name, for example step-00000510")
     parser.add_argument("--successes", type=int, required=True)
     parser.add_argument("--trials", type=int, required=True)

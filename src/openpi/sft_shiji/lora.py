@@ -3,11 +3,42 @@
 from __future__ import annotations
 
 import math
+import dataclasses
 from pathlib import Path
+from typing import Literal
 
 import safetensors.torch
 import torch
 from torch import nn
+
+
+FineTuneMode = Literal["a", "b", "c", "d", "e", "full"]
+
+
+@dataclasses.dataclass(frozen=True)
+class FineTuneSpec:
+    rank: int
+    alpha: float
+    adapt_vision: bool
+    unfreeze_action_head: bool = False
+    unfreeze_expert_last_n_layers: int = 0
+    full_finetune: bool = False
+
+
+EXPERIMENTS: dict[FineTuneMode, FineTuneSpec] = {
+    "a": FineTuneSpec(rank=16, alpha=32.0, adapt_vision=False),
+    "b": FineTuneSpec(rank=16, alpha=32.0, adapt_vision=True),
+    "c": FineTuneSpec(rank=32, alpha=64.0, adapt_vision=True),
+    "d": FineTuneSpec(rank=16, alpha=32.0, adapt_vision=True, unfreeze_action_head=True),
+    "e": FineTuneSpec(
+        rank=16,
+        alpha=32.0,
+        adapt_vision=True,
+        unfreeze_action_head=True,
+        unfreeze_expert_last_n_layers=2,
+    ),
+    "full": FineTuneSpec(rank=0, alpha=0.0, adapt_vision=False, full_finetune=True),
+}
 
 
 class LoRALinear(nn.Module):
@@ -105,15 +136,56 @@ def inject_lora(
     return replaced
 
 
+def configure_finetuning(
+    model: nn.Module,
+    mode: FineTuneMode,
+    *,
+    dropout: float,
+) -> tuple[FineTuneSpec, list[str]]:
+    spec = EXPERIMENTS[mode]
+    if spec.full_finetune:
+        for parameter in model.parameters():
+            parameter.requires_grad = True
+        return spec, []
+
+    replaced = inject_lora(
+        model,
+        rank=spec.rank,
+        alpha=spec.alpha,
+        dropout=dropout,
+        adapt_backbone=True,
+        adapt_expert=True,
+        adapt_vision=spec.adapt_vision,
+        adapt_projector=True,
+    )
+    if spec.unfreeze_action_head:
+        for module_name in ("action_in_proj", "action_out_proj", "time_mlp_in", "time_mlp_out"):
+            module = getattr(model, module_name, None)
+            if module is not None:
+                for parameter in module.parameters():
+                    parameter.requires_grad = True
+    if spec.unfreeze_expert_last_n_layers:
+        layers = model.paligemma_with_expert.gemma_expert.model.layers
+        if spec.unfreeze_expert_last_n_layers > len(layers):
+            raise ValueError(
+                f"Cannot unfreeze {spec.unfreeze_expert_last_n_layers} expert layers; model has {len(layers)}"
+            )
+        for layer in layers[-spec.unfreeze_expert_last_n_layers:]:
+            for parameter in layer.parameters():
+                parameter.requires_grad = True
+    return spec, replaced
+
+
 def trainable_parameters(model: nn.Module) -> list[nn.Parameter]:
     return [parameter for parameter in model.parameters() if parameter.requires_grad]
 
 
 def adapter_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
+    trainable_names = {name for name, parameter in model.named_parameters() if parameter.requires_grad}
     return {
         name: value.detach().cpu().contiguous()
         for name, value in model.state_dict().items()
-        if ".lora_a" in name or ".lora_b" in name
+        if name in trainable_names
     }
 
 

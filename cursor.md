@@ -1,5 +1,61 @@
 # pi0.5 LIBERO RL：研发与运行日志
 
+## [2026-08-11 01:00] TensorBoard 物理动作推理评估
+
+### Action
+- 每次边界验证除 flow-matching loss 外，使用固定噪声种子执行完整 diffusion action sampling，并反归一化到物理 consecutive-delta 空间。
+- TensorBoard 新增总体平移/旋转 RMSE、零动作 RMSE、相对零动作改善率，以及每个 action horizon 的平移/旋转 RMSE。
+- 增加验证推理批次数、diffusion steps 和固定 noise seed 配置。
+
+### Reason
+- 训练和验证 loss 不能直接衡量采样动作的物理精度；A-E/full 实验需要使用相同噪声和物理指标进行公平比较。
+
+### Impact
+- 边界验证耗时增加；默认对完整验证轨迹执行 10 步 diffusion，所有实验可在统一 TensorBoard 中叠加同名曲线。
+
+### Refs
+- `src/openpi/sft_shiji/train.py:51-54,147-222,456-481`
+- `src/openpi/sft_shiji/dataset.py:311-313`
+
+## [2026-08-11 00:30] 连续 delta 动作与单卡 H200 微调模式
+
+### Action
+- HDF5 relative action 改为 `action[k] = pose(t+k+1) - pose(t+k)`，旋转差包装到 `[-pi, pi)`，并写入 `action_definition=consecutive_delta`。
+- 推理拒绝旧的 delta-to-anchor HDF5，防止新模型与旧标签混用。
+- 新增 `--finetune-mode {a,b,c,d,e,full}`：覆盖 rank 16/32、视觉 LoRA、动作头解冻、Action Expert 尾部两层解冻及全参数微调。
+- 单卡 H200 默认使用连续轨迹内 micro batch 8、梯度累积 2；所有 HDF5 帧仍按顺序且恰好训练一次。
+
+### Reason
+- 控制动作定义为相邻控制周期的 delta 位姿；旧标签的远期动作是相对 anchor 的累计变化。
+- H200 可在单卡上提高真实 batch 和可训练参数量，无需先引入多卡调度复杂度。
+
+### Impact
+- 必须重新转换全部 HDF5、从 base checkpoint 重新训练并重新推理；旧 adapter、旧 norm stats 和旧推理结果不可复用。
+- 部分解冻和 full 模式的 checkpoint 现在保存所有 `requires_grad` 参数，而不只是 LoRA 张量。
+
+### Refs
+- `src/openpi/sft_shiji/convert_to_hdf5.py:82-104`
+- `src/openpi/sft_shiji/lora.py:13-44,137-176`
+- `src/openpi/sft_shiji/train.py:33-64,323-379`
+- 公式：`delta_pose[k] = wrap_pose(pose(t+k+1) - pose(t+k))`
+
+## [2026-08-11 00:00] 完整 HDF5 轨迹级随机化训练
+
+### Action
+- `sft_shiji/train.py` 改为每个 epoch 使用 `seed + epoch` 对完整 HDF5 轨迹列表生成可复现随机排列。
+- 单个 HDF5 内部 timestep 始终保持从前到后的顺序，梯度累积仍在轨迹边界结束，不跨轨迹。
+- 训练 manifest 和日志记录随机策略及每个 epoch 的实际轨迹顺序。
+
+### Reason
+- 避免每轮固定轨迹顺序带来的轨迹顺序偏置，同时保留视频帧和机器人状态的完整时序结构。
+
+### Impact
+- 重新训练时轨迹访问顺序逐 epoch 改变；同一随机种子和 epoch 可严格复现，也支持从完整轨迹边界恢复。
+
+### Refs
+- `src/openpi/sft_shiji/train.py:294-303,365-386`
+- 公式：`permutation_epoch = Shuffle(train_trajectories, seed + epoch)`
+
 ## [2026-07-25] 官方 pi05_libero JAX→PyTorch 基线与双环境胜率测试
 
 ### Action

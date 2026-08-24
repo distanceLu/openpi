@@ -26,6 +26,16 @@ CAMERA_TO_MODEL_KEY = {
 }
 
 
+class SymmetricActionUnnormalizer:
+    def __init__(self, action_stats: normalize_api.NormStats):
+        if action_stats.q99 is None:
+            raise ValueError("Symmetric action statistics require q99 scales")
+        self.scale = np.asarray(action_stats.q99, dtype=np.float32)
+
+    def __call__(self, data: dict) -> dict:
+        return {**data, "actions": np.asarray(data["actions"]) * self.scale}
+
+
 @dataclasses.dataclass(frozen=True)
 class TimedPath:
     timestamp: int
@@ -82,9 +92,8 @@ def _timestamp_from_image(path: Path) -> int:
 
 
 def _camera_stream(directory: Path) -> list[TimedPath]:
-    frames = [TimedPath(_timestamp_from_image(path), path) for path in directory.glob("*.jpg")]
-    frames.extend(TimedPath(_timestamp_from_image(path), path) for path in directory.glob("*.jpeg"))
-    frames.extend(TimedPath(_timestamp_from_image(path), path) for path in directory.glob("*.png"))
+
+    frames = [TimedPath(_timestamp_from_image(path), path) for path in directory.iterdir() if path.suffix.lower() in {".jpg", ".jpeg", ".png"}]
     return sorted(frames, key=lambda frame: (frame.timestamp, frame.path.name))
 
 
@@ -123,7 +132,6 @@ def _nearest_index(timestamps: Sequence[int] | np.ndarray, target: int) -> tuple
 
 
 def _first_at_or_after_index(timestamps: Sequence[int] | np.ndarray, target: int) -> tuple[int, int]:
-    """Return the first frame at or after target; never leak an earlier camera frame."""
     index = bisect_left(timestamps, target)
     if index >= len(timestamps):
         raise IndexError("No camera frame exists at or after the target timestamp")
@@ -187,10 +195,13 @@ def align_recording(recording_dir: Path, config: AlignmentConfig) -> list[Aligne
             action_rows.append(robot_poses[action_index])
         if not valid:
             continue
-        actions = np.stack(action_rows).astype(np.float32)
+        future_poses = np.stack(action_rows).astype(np.float32)
         if config.action_mode == "relative_pose":
-            actions = actions - state[None, :]
+            previous_poses = np.concatenate([state[None, :], future_poses[:-1]], axis=0)
+            actions = future_poses - previous_poses
             actions[:, 3:] = (actions[:, 3:] + np.pi) % (2.0 * np.pi) - np.pi
+        else:
+            actions = future_poses
 
         aligned.append(
             AlignedSample(
@@ -292,16 +303,23 @@ class RealRobotDataset(torch.utils.data.Dataset):
         model_action_dim: int = 32,
         max_token_len: int = 200,
         use_paper_state: bool = False,
+        use_robot_state: bool = False,
     ):
         if not prompt.strip():
             raise ValueError("A non-empty task prompt is required")
         self.samples = list(samples)
         self.prompt = prompt
         self.use_paper_state = use_paper_state
-        self.normalizer = transforms.Normalize(norm_stats, use_quantiles=True, strict=False)
+        self.use_robot_state = use_robot_state
+        state_norm_stats = {"state": norm_stats["state"]} if use_robot_state else None
+        self.normalizer = transforms.Normalize(state_norm_stats, use_quantiles=True, strict=False)
+        self.action_scale = np.asarray(norm_stats["actions"].q99, dtype=np.float32)
+        if np.any(self.action_scale <= 0) or not np.isfinite(self.action_scale).all():
+            raise ValueError(f"Invalid symmetric action scales: {self.action_scale}")
+        self.unnormalizer = SymmetricActionUnnormalizer(norm_stats["actions"])
         self.resize = transforms.ResizeImages(224, 224)
         self.tokenize = transforms.TokenizePrompt(
-            tokenizer_api.PaligemmaTokenizer(max_token_len), discrete_state_input=True
+            tokenizer_api.PaligemmaTokenizer(max_token_len), discrete_state_input=use_robot_state
         )
         self.pad = transforms.PadStatesAndActions(model_action_dim)
 
@@ -313,21 +331,31 @@ class RealRobotDataset(torch.utils.data.Dataset):
         with Image.open(path) as image:
             return np.asarray(image.convert("RGB"), dtype=np.uint8)
 
+    def transform_sample(self, data: dict) -> dict:
+        data = dict(data)
+        if not self.use_robot_state:
+            data["state"] = np.zeros_like(data["state"], dtype=np.float32)
+        data["prompt"] = self.prompt
+        data = self.resize(data)
+        data = self.normalizer(data)
+        data["state"] = np.asarray(data["state"], dtype=np.float32)
+        data["actions"] = np.clip(
+            np.asarray(data["actions"], dtype=np.float32) / self.action_scale,
+            -1.0,
+            1.0,
+        )
+        data = self.tokenize(data)
+        return self.pad(data)
+
     def __getitem__(self, index: int) -> dict:
         sample = self.samples[index]
         data = {
             "image": {key: self._read_image(path) for key, path in sample.images.items()},
             "image_mask": dict.fromkeys(CAMERA_TO_MODEL_KEY.values(), np.True_),
-            "state": sample.state.copy(),
+            "state": sample.state.copy() if self.use_robot_state else np.zeros_like(sample.state),
             "actions": sample.actions.copy(),
-            "prompt": self.prompt,
         }
-        data = self.resize(data)
-        data = self.normalizer(data)
-        data["state"] = np.asarray(data["state"], dtype=np.float32)
-        data["actions"] = np.asarray(data["actions"], dtype=np.float32)
-        data = self.tokenize(data)
-        return self.pad(data)
+        return self.transform_sample(data)
 
 
 def batch_to_model(batch: dict) -> tuple[model_api.Observation, torch.Tensor]:
