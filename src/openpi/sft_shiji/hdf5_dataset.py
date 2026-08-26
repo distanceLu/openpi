@@ -34,7 +34,17 @@ def compute_hdf5_norm_stats(
     for path in paths:
         with h5py.File(path, "r") as file:
             states.append(np.asarray(file["observations/state"], dtype=np.float64))
-            actions.append(np.asarray(file["actions/trajectory"], dtype=np.float64).reshape(-1, 6))
+            trajectory_actions = np.asarray(file["actions/trajectory"], dtype=np.float64)
+            if "actions/valid_mask" in file:
+                valid_mask = np.asarray(file["actions/valid_mask"], dtype=np.bool_)
+                if valid_mask.shape != trajectory_actions.shape[:2]:
+                    raise ValueError(
+                        f"Invalid action mask shape in {path}: {valid_mask.shape}; "
+                        f"expected {trajectory_actions.shape[:2]}"
+                    )
+                actions.append(trajectory_actions[valid_mask])
+            else:
+                actions.append(trajectory_actions.reshape(-1, 6))
     if not states:
         raise ValueError("No HDF5 trajectories were found")
     if not 0.5 < action_abs_quantile <= 1.0:
@@ -125,11 +135,18 @@ class HDF5Trajectory:
         for camera_name, model_key in CAMERA_TO_MODEL_KEY.items():
             source_index = int(file[f"observations/image_index/{camera_name}"][index])
             images[model_key] = self._decode(file[f"observations/images/{camera_name}"][source_index])
+        actions = np.asarray(file["actions/trajectory"][index], dtype=np.float32)
+        action_valid_mask = (
+            np.asarray(file["actions/valid_mask"][index], dtype=np.bool_)
+            if "actions/valid_mask" in file
+            else np.ones(actions.shape[0], dtype=np.bool_)
+        )
         return {
             "image": images,
             "image_mask": dict.fromkeys(CAMERA_TO_MODEL_KEY.values(), np.True_),
             "state": np.asarray(file["observations/state"][index], dtype=np.float32),
-            "actions": np.asarray(file["actions/trajectory"][index], dtype=np.float32),
+            "actions": actions,
+            "action_valid_mask": action_valid_mask,
         }
 
 
@@ -165,7 +182,9 @@ class HDF5EpisodeDataset:
         with HDF5Trajectory(path) as trajectory:
             for index in range(trajectory.length):
                 raw = trajectory.read_step(index)
-                is_moving = bool(np.any(np.abs(raw["actions"][:, 2]) >= motion_threshold))
+                is_moving = bool(np.any(
+                    np.abs(raw["actions"][raw["action_valid_mask"], 2]) >= motion_threshold
+                ))
                 yield (
                     trajectory.episode_id,
                     index,

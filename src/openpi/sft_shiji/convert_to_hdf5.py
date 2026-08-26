@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import itertools
 from pathlib import Path
 
 import h5py
@@ -169,13 +168,23 @@ def convert_recording(
     generated_delta_path = destination.parent / "generated_command_delta" / f"{destination.stem}.csv"
     command_delta_path = _derive_command_deltas(recording, generated_delta_path)
     command_timestamps, pool_filenames, recorded_states, deltas = _read_command_deltas(command_delta_path)
-    max_offset = round(max_camera_offset_ms * config.timestamp_ticks_per_second / 1000.0)
-    max_action_offset = round(max_action_offset_ms * config.timestamp_ticks_per_second / 1000.0)
     stream_timestamps = {
         name: np.asarray([frame.timestamp for frame in stream], dtype=np.int64)
         for name, stream in streams.items()
     }
     pool_by_name = {frame.path.name: index for index, frame in enumerate(streams["camera_pool"])}
+    command_by_pool_name = {name: index for index, name in enumerate(pool_filenames)}
+    if len(pool_by_name) != len(streams["camera_pool"]):
+        raise ValueError(f"{recording.name} has duplicate camera_pool filenames")
+    if len(command_by_pool_name) != len(pool_filenames):
+        raise ValueError(f"{recording.name} has duplicate pool_image values in command_delta.csv")
+    missing_command_rows = sorted(set(pool_by_name).difference(command_by_pool_name))
+    extra_command_rows = sorted(set(command_by_pool_name).difference(pool_by_name))
+    if missing_command_rows or extra_command_rows:
+        raise ValueError(
+            f"{recording.name} camera_pool images and command_delta pool_image values must match exactly; "
+            f"missing command rows={missing_command_rows}, extra command rows={extra_command_rows}"
+        )
 
     valid_times: list[int] = []
     command_indices: list[int] = []
@@ -186,61 +195,45 @@ def convert_recording(
     action_indices: list[np.ndarray] = []
     action_timestamps: list[np.ndarray] = []
     action_offsets: list[np.ndarray] = []
+    action_valid_masks: list[np.ndarray] = []
+    leading_image_fills: dict[str, list[bool]] = {name: [] for name in streams}
 
-    if len(command_timestamps) < config.action_horizon:
-        raise ValueError(
-            f"{recording.name} has {len(command_timestamps)} command rows, fewer than "
-            f"action_horizon={config.action_horizon}"
-        )
-    for row_index in range(len(command_timestamps)):
-        timestamp = int(command_timestamps[row_index])
-        target_action_timestamps = timestamp + np.arange(config.action_horizon) * config.control_period
-        matched_action_indices = []
-        matched_action_offsets = []
-        for target_timestamp in target_action_timestamps:
-            action_index, action_offset = _nearest_index(command_timestamps, int(target_timestamp))
-            matched_action_indices.append(action_index)
-            matched_action_offsets.append(action_offset)
-        if (
-            any(offset > max_action_offset for offset in matched_action_offsets)
-            or any(
-                current >= following
-                for current, following in itertools.pairwise(matched_action_indices)
-            )
-        ):
-            continue
-        camera_matches: dict[str, tuple[int, int]] = {}
-        pool_index = pool_by_name.get(pool_filenames[row_index])
-        if pool_index is None:
-            pool_index, pool_error = _nearest_index(stream_timestamps["camera_pool"], timestamp)
-        else:
-            pool_error = abs(int(stream_timestamps["camera_pool"][pool_index]) - timestamp)
-        camera_matches["camera_pool"] = (pool_index, pool_error)
-        causal_match_missing = False
+    for pool_index, pool_frame in enumerate(streams["camera_pool"]):
+        timestamp = int(pool_frame.timestamp)
+        row_index = command_by_pool_name[pool_frame.path.name]
+        raw_action_indices = row_index + np.arange(config.action_horizon, dtype=np.int64)
+        valid_action_mask = raw_action_indices < len(command_timestamps)
+        matched_action_indices = np.minimum(raw_action_indices, len(command_timestamps) - 1)
+
+        camera_matches: dict[str, tuple[int, int, bool]] = {
+            "camera_pool": (pool_index, 0, False),
+        }
         for name in ("camera_paper_aruco", "camera_pool1"):
             if allow_future_camera_frames:
-                camera_matches[name] = _nearest_index(stream_timestamps[name], timestamp)
+                index, offset = _nearest_index(stream_timestamps[name], timestamp)
+                leading_fill = int(stream_timestamps[name][index]) > timestamp
+                signed_age = timestamp - int(stream_timestamps[name][index])
             else:
-                index = _latest_at_or_before_index(stream_timestamps[name], timestamp)
-                if index is None:
-                    causal_match_missing = True
-                    break
-                camera_matches[name] = (index, timestamp - int(stream_timestamps[name][index]))
-        if causal_match_missing or any(offset > max_offset for _, offset in camera_matches.values()):
-            continue
+                causal_index = _latest_at_or_before_index(stream_timestamps[name], timestamp)
+                leading_fill = causal_index is None
+                index = 0 if causal_index is None else causal_index
+                signed_age = timestamp - int(stream_timestamps[name][index])
+            camera_matches[name] = (index, signed_age, leading_fill)
 
-        action = deltas[np.asarray(matched_action_indices, dtype=np.int64)].copy()
+        action = deltas[matched_action_indices].copy()
         state = recorded_states[row_index].copy() if use_robot_state else np.zeros(6, dtype=np.float32)
         valid_times.append(timestamp)
         command_indices.append(row_index)
         states.append(state)
         actions.append(action)
-        action_indices.append(np.asarray(matched_action_indices, dtype=np.int64))
+        action_indices.append(matched_action_indices)
         action_timestamps.append(command_timestamps[matched_action_indices].copy())
-        action_offsets.append(np.asarray(matched_action_offsets, dtype=np.int64))
-        for name, (index, offset) in camera_matches.items():
+        action_offsets.append(command_timestamps[matched_action_indices].copy() - timestamp)
+        action_valid_masks.append(valid_action_mask)
+        for name, (index, offset, leading_fill) in camera_matches.items():
             selected_indices[name].append(index)
             selected_offsets[name].append(offset)
+            leading_image_fills[name].append(leading_fill)
 
     if not valid_times:
         raise ValueError(f"{recording.name} has no valid three-camera command-delta chunks")
@@ -253,28 +246,37 @@ def convert_recording(
     with h5py.File(temporary, "w") as file:
         metadata = file.create_group("metadata")
         metadata.attrs.update({
-            "format_version": 3,
+            "format_version": 4,
             "episode_id": destination.stem,
             "source_directory": str(recording),
             "number_of_steps": len(valid_times),
             "timestamp_ticks_per_second": config.timestamp_ticks_per_second,
             "action_horizon": config.action_horizon,
             "action_mode": "relative_pose",
-            "action_definition": "command_delta_csv: fixed-rate rows from current anchor",
-            "action_sampling": "fixed-rate nearest command_delta rows from anchor, including anchor",
-            "action_frequency_hz": config.control_hz,
-            "action_period_ms": 1000.0 / config.control_hz,
+            "action_definition": "command_delta_csv: current and following recorded rows by sequence index",
+            "action_sampling": "current command_delta row plus following rows; tail indices clamp to final row and are masked",
+            "action_frequency_hz": "recorded_variable_rate",
+            "nominal_action_frequency_hz": config.control_hz,
             "max_action_offset_ms": max_action_offset_ms,
             "action_source": str(command_delta_path),
             "state_source": "command_delta.csv:actual_tcp" if use_robot_state else "disabled_zero_vector",
             "use_robot_state": use_robot_state,
             "max_camera_offset_ms": max_camera_offset_ms,
+            "anchor_policy": "every actual camera_pool image in source order",
             "camera_alignment": (
-                "nearest image to command_delta pool_timestamp; camera_pool prefers pool_image"
+                "camera_pool is the exact anchor image; side cameras use nearest image"
                 if allow_future_camera_frames
-                else "latest side-camera image at or before command_delta pool_timestamp; camera_pool uses pool_image"
+                else "camera_pool is the exact anchor image; side cameras use latest image at or before anchor, with first image for leading fill"
             ),
             "future_camera_frames_allowed": allow_future_camera_frames,
+            "samples_are_never_dropped": True,
+            "source_camera_pool_frames": len(streams["camera_pool"]),
+            "source_camera_pool1_frames": len(streams["camera_pool1"]),
+            "source_camera_paper_aruco_frames": len(streams["camera_paper_aruco"]),
+            "leading_fill_camera_pool": int(sum(leading_image_fills["camera_pool"])),
+            "leading_fill_camera_pool1": int(sum(leading_image_fills["camera_pool1"])),
+            "leading_fill_camera_paper_aruco": int(sum(leading_image_fills["camera_paper_aruco"])),
+            "tail_masked_action_positions": int(sum(mask.size - np.count_nonzero(mask) for mask in action_valid_masks)),
             "infer_filter": "recording directory names containing infer are excluded",
         })
         file.create_dataset("timestamps/anchor", data=np.asarray(valid_times, dtype=np.int64))
@@ -305,8 +307,14 @@ def convert_recording(
             )
         file.create_dataset("observations/state", data=np.stack(states), compression="lzf")
         file.create_dataset("actions/trajectory", data=np.stack(actions), compression="lzf")
+        file.create_dataset("actions/valid_mask", data=np.stack(action_valid_masks))
         file.create_dataset("validity/valid_step", data=np.ones(len(valid_times), dtype=np.bool_))
         file.flush()
+    if len(valid_times) != len(streams["camera_pool"]):
+        raise AssertionError(
+            f"{recording.name} wrote {len(valid_times)} anchors for "
+            f"{len(streams['camera_pool'])} camera_pool images"
+        )
     temporary.replace(destination)
     return len(valid_times)
 
@@ -321,12 +329,12 @@ def main() -> None:
     parser.add_argument(
         "--output-root",
         type=Path,
-        default=Path("/mnt/data/lcx1/yiqinworkspace/openpi/src/openpi/sft_shiji/hdf5_data/2026-08-05-06-command-delta-causal-10hz-v2"),
+        default=Path("/mnt/data/lcx1/yiqinworkspace/openpi/src/openpi/sft_shiji/hdf5_data/2026-08-05-06-command-delta-image-indexed-v3"),
     )
     parser.add_argument("--max-camera-offset-ms", type=float, default=100.0)
     parser.add_argument("--max-action-offset-ms", type=float, default=50.0)
     parser.add_argument("--action-horizon", type=int, default=10)
-    parser.add_argument("--control-hz", type=float, default=10.0)
+    parser.add_argument("--control-hz", type=float, default=20.0)
     parser.add_argument(
         "--recording-dates",
         default="2026-08-05,2026-08-06",

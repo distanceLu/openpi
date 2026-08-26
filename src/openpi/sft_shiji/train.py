@@ -62,7 +62,6 @@ class TrainConfig:
     validation_recording: str = "14-40-19"
     early_stopping_patience: int = 5
     early_stopping_min_delta: float = 1e-4
-    early_stopping_overfit_ratio: float = 1.25
     tensorboard_dir: Path | None = None
     resume_from: Path | None = None
     seed: int = 42
@@ -91,12 +90,17 @@ def _motion_counts(paths: list[Path], threshold: float) -> tuple[int, int]:
     for path in paths:
         with h5py.File(path, "r") as file:
             actions = np.asarray(file["actions/trajectory"][:, :, 2])
-        moving += int(np.sum(np.any(np.abs(actions) >= threshold, axis=1)))
+            valid_mask = (
+                np.asarray(file["actions/valid_mask"], dtype=np.bool_)
+                if "actions/valid_mask" in file
+                else np.ones(actions.shape, dtype=np.bool_)
+            )
+        moving += int(np.sum(np.any((np.abs(actions) >= threshold) & valid_mask, axis=1)))
         total += actions.shape[0]
     return moving, total - moving
 
 
-def _action_mask(mask_non_z_actions: bool, device: torch.device) -> torch.Tensor | None:
+def _action_mask(*, mask_non_z_actions: bool, device: torch.device) -> torch.Tensor | None:
     if not mask_non_z_actions:
         return None
     mask = torch.zeros(32, dtype=torch.float32, device=device)
@@ -109,11 +113,20 @@ def _masked_training_loss(
     observation,
     actions: torch.Tensor,
     action_mask: torch.Tensor | None,
+    action_valid_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     losses = model(observation, actions.float(), action_mask=action_mask)
-    if action_mask is None:
-        return losses.mean()
-    return losses.sum() / (losses.shape[0] * losses.shape[1] * action_mask.sum())
+    combined_mask = torch.ones_like(losses)
+    if action_mask is not None:
+        combined_mask = combined_mask * action_mask.reshape(1, 1, -1).to(losses.dtype)
+    if action_valid_mask is not None:
+        if action_valid_mask.shape != losses.shape[:2]:
+            raise ValueError(
+                f"action_valid_mask has shape {tuple(action_valid_mask.shape)}, "
+                f"expected {tuple(losses.shape[:2])}"
+            )
+        combined_mask = combined_mask * action_valid_mask[:, :, None].to(losses.dtype)
+    return (losses * combined_mask).sum() / combined_mask.sum().clamp_min(1.0)
 
 
 def _model_file(checkpoint: Path) -> Path:
@@ -157,7 +170,7 @@ def _learning_rate(step: int, config: TrainConfig) -> float:
 def _optimizer_step(
     model_parameters: list[torch.nn.Parameter],
     optimizer: torch.optim.Optimizer,
-    accumulated: int,
+    accumulated: float,
     config: TrainConfig,
     step: int,
 ) -> tuple[float, float]:
@@ -185,17 +198,29 @@ def evaluate_trajectories(
     device: torch.device,
     max_steps: int,
     action_mask: torch.Tensor | None,
+    noise_seed: int,
 ) -> float:
     model.eval()
     losses = []
-    for path in paths:
-        for _, _, sample in dataset.iter_trajectory(path):
-            batch = _move(default_collate([sample]), device)
-            observation, actions = batch_to_model(batch)
-            losses.append(float(_masked_training_loss(model, observation, actions, action_mask).item()))
-            if max_steps > 0 and len(losses) >= max_steps:
-                model.train()
-                return sum(losses) / len(losses)
+    fork_devices = (
+        [device.index if device.index is not None else torch.cuda.current_device()]
+        if device.type == "cuda"
+        else []
+    )
+    with torch.random.fork_rng(devices=fork_devices):
+        torch.manual_seed(noise_seed)
+        if device.type == "cuda":
+            torch.cuda.manual_seed_all(noise_seed)
+        for path in paths:
+            for _, _, sample in dataset.iter_trajectory(path):
+                batch = _move(default_collate([sample]), device)
+                observation, actions = batch_to_model(batch)
+                losses.append(float(_masked_training_loss(
+                    model, observation, actions, action_mask, batch.get("action_valid_mask")
+                ).item()))
+                if max_steps > 0 and len(losses) >= max_steps:
+                    model.train()
+                    return sum(losses) / len(losses)
     model.train()
     return sum(losses) / max(1, len(losses))
 
@@ -271,6 +296,7 @@ def evaluate_inference_metrics(
     model.eval()
     predictions = []
     targets = []
+    valid_masks = []
     generator = torch.Generator(device=device).manual_seed(noise_seed)
     for path in paths:
         for _, _, sample in dataset.iter_trajectory(path):
@@ -292,6 +318,9 @@ def evaluate_inference_metrics(
                 target_physical[..., ~physical_mask] = 0.0
             predictions.append(predicted_physical)
             targets.append(target_physical)
+            valid_masks.append(np.asarray(sample.get(
+                "action_valid_mask", np.ones(target_physical.shape[1], dtype=np.bool_)
+            ), dtype=np.bool_)[None, :])
             if max_steps > 0 and len(predictions) >= max_steps:
                 break
         if max_steps > 0 and len(predictions) >= max_steps:
@@ -301,8 +330,11 @@ def evaluate_inference_metrics(
         return {}
     predicted = np.concatenate(predictions, axis=0)
     target = np.concatenate(targets, axis=0)
-    model_metrics = _physical_error(predicted, target)
-    zero_metrics = _physical_error(np.zeros_like(target), target)
+    valid_mask = np.concatenate(valid_masks, axis=0)
+    valid_predicted = predicted[valid_mask]
+    valid_target = target[valid_mask]
+    model_metrics = _physical_error(valid_predicted, valid_target)
+    zero_metrics = _physical_error(np.zeros_like(valid_target), valid_target)
     result = {
         "physical/translation_rmse": model_metrics["translation_rmse"],
         "physical/rotation_rmse_rad": model_metrics["rotation_rmse_rad"],
@@ -315,17 +347,22 @@ def evaluate_inference_metrics(
     }
     for axis, axis_name in enumerate(ACTION_NAMES):
         result[f"physical/axis_{axis_name}/wape_percent"] = float(
-            100.0 * np.sum(np.abs(predicted[..., axis] - target[..., axis]))
-            / max(float(np.sum(np.abs(target[..., axis]))), np.finfo(np.float64).eps)
+            100.0 * np.sum(np.abs(valid_predicted[..., axis] - valid_target[..., axis]))
+            / max(float(np.sum(np.abs(valid_target[..., axis]))), np.finfo(np.float64).eps)
         )
         result[f"physical/axis_{axis_name}/rmse"] = float(
-            np.sqrt(np.mean(np.square(predicted[..., axis] - target[..., axis])))
+            np.sqrt(np.mean(np.square(valid_predicted[..., axis] - valid_target[..., axis])))
         )
     for horizon in range(target.shape[1]):
-        horizon_metrics = _physical_error(predicted[:, horizon], target[:, horizon])
+        horizon_valid = valid_mask[:, horizon]
+        if not np.any(horizon_valid):
+            continue
+        horizon_metrics = _physical_error(
+            predicted[horizon_valid, horizon], target[horizon_valid, horizon]
+        )
         result[f"physical/horizon_{horizon + 1:02d}/translation_rmse"] = horizon_metrics["translation_rmse"]
         result[f"physical/horizon_{horizon + 1:02d}/rotation_rmse_rad"] = horizon_metrics["rotation_rmse_rad"]
-    for name, value in _z_physical_error(predicted, target, motion_threshold).items():
+    for name, value in _z_physical_error(valid_predicted, valid_target, motion_threshold).items():
         result[f"physical/{name}"] = value
     model.train()
     return result
@@ -370,8 +407,8 @@ def train(config: TrainConfig) -> None:
         raise ValueError("validation batch limits must be non-negative")
     if config.validation_diffusion_steps <= 0:
         raise ValueError("validation_diffusion_steps must be positive")
-    if config.early_stopping_min_delta < 0 or config.early_stopping_overfit_ratio <= 1.0:
-        raise ValueError("early stopping min_delta must be non-negative and overfit_ratio must exceed 1")
+    if config.early_stopping_min_delta < 0:
+        raise ValueError("early stopping min_delta must be non-negative")
     if not np.isfinite(config.motion_threshold) or config.motion_threshold <= 0:
         raise ValueError("motion_threshold must be finite and positive")
     if config.max_balance_repeat <= 0 or not 0.5 < config.action_abs_quantile <= 1.0:
@@ -449,6 +486,7 @@ def train(config: TrainConfig) -> None:
         stationary_steps * stationary_repeat + moving_steps * moving_repeat
     )
     optimizer_steps_per_epoch = math.ceil(balanced_train_timesteps / samples_per_update)
+    validate_each_epoch = config.validation_interval == 0
     validation_interval = config.validation_interval or optimizer_steps_per_epoch
     normalize_api.save(output_dir / "assets" / "real_robot", norm_stats)
     (output_dir / "train_config.json").write_text(json.dumps({
@@ -465,7 +503,8 @@ def train(config: TrainConfig) -> None:
         "trajectory_shuffle_seed": config.seed,
         "trajectory_shuffle_policy": "deterministic permutation per epoch using seed + epoch",
         "shuffle_timesteps": False,
-        "gradient_accumulation_crosses_trajectory_boundary": False,
+        "gradient_accumulation_crosses_trajectory_boundary": True,
+        "partial_micro_batches_weighted_by_sample_count": True,
         "motion_sampling": {
             "enabled": config.balance_motion_samples,
             "threshold": config.motion_threshold,
@@ -488,7 +527,7 @@ def train(config: TrainConfig) -> None:
     )
 
     device = torch.device("cuda:0")
-    action_mask = _action_mask(config.mask_non_z_actions, device)
+    action_mask = _action_mask(mask_non_z_actions=config.mask_non_z_actions, device=device)
     logging.info(
         "Training action axes=%s; disabled axes are forced to zero",
         [name for index, name in enumerate(ACTION_NAMES) if action_mask is None or action_mask[index] > 0],
@@ -587,6 +626,11 @@ def train(config: TrainConfig) -> None:
             if not resume_pending:
                 epoch += 1
             current_train_files = epoch_trajectories(epoch)
+            epoch_loss = 0.0
+            epoch_timesteps = 0
+            accumulated = 0.0
+            accumulated_loss = 0.0
+            accumulated_samples = 0
             logging.info("epoch=%d shuffled trajectory order=%s", epoch, [path.stem for path in current_train_files])
             for episode_index, path in enumerate(current_train_files):
                 if resume_pending:
@@ -596,8 +640,6 @@ def train(config: TrainConfig) -> None:
                     continue
                 episode_loss = 0.0
                 episode_timesteps = 0
-                accumulated = 0
-                accumulated_loss = 0.0
                 last_update_loss = 0.0
                 logging.info(
                     "epoch=%d trajectory=%d/%d episode=%s timesteps=%d",
@@ -618,43 +660,61 @@ def train(config: TrainConfig) -> None:
                         del pending_timesteps[: config.micro_batch_size]
                         batch = _move(default_collate(current_samples), device)
                         observation, actions = batch_to_model(batch)
-                        loss = _masked_training_loss(model, observation, actions, action_mask)
-                        (loss / config.gradient_accumulation_steps).backward()
-                        value = float(loss.detach().item())
+                        loss = _masked_training_loss(
+                            model, observation, actions, action_mask,
+                            batch.get("action_valid_mask"),
+                        )
                         batch_timesteps = len(current_samples)
+                        batch_weight = batch_timesteps / config.micro_batch_size
+                        (loss * batch_weight / config.gradient_accumulation_steps).backward()
+                        value = float(loss.detach().item())
                         episode_loss += value * batch_timesteps
-                        accumulated_loss += value
+                        accumulated_loss += value * batch_timesteps
+                        accumulated_samples += batch_timesteps
                         episode_timesteps += batch_timesteps
-                        accumulated += 1
+                        accumulated += batch_weight
                         writer.add_scalar("trajectory/timestep", current_timesteps[-1], step)
-                        if accumulated == config.gradient_accumulation_steps:
+                        if accumulated >= config.gradient_accumulation_steps:
                             learning_rate, grad_norm = _optimizer_step(trainable, optimizer, accumulated, config, step)
                             step += 1
-                            last_update_loss = accumulated_loss / accumulated
-                            accumulated = 0
+                            last_update_loss = accumulated_loss / max(1, accumulated_samples)
+                            accumulated = 0.0
                             accumulated_loss = 0.0
+                            accumulated_samples = 0
                             writer.add_scalar("loss/train", last_update_loss, step)
                             writer.add_scalar("optimization/learning_rate", learning_rate, step)
                             writer.add_scalar("optimization/gradient_norm", grad_norm, step)
                 if pending_samples:
+                    batch_timesteps = len(pending_samples)
                     batch = _move(default_collate(pending_samples), device)
                     observation, actions = batch_to_model(batch)
-                    loss = _masked_training_loss(model, observation, actions, action_mask)
-                    (loss / config.gradient_accumulation_steps).backward()
+                    loss = _masked_training_loss(
+                        model, observation, actions, action_mask,
+                        batch.get("action_valid_mask"),
+                    )
+                    batch_weight = batch_timesteps / config.micro_batch_size
+                    (loss * batch_weight / config.gradient_accumulation_steps).backward()
                     value = float(loss.detach().item())
-                    episode_loss += value * len(pending_samples)
-                    accumulated_loss += value
-                    episode_timesteps += len(pending_samples)
-                    accumulated += 1
-                if accumulated:
+                    episode_loss += value * batch_timesteps
+                    accumulated_loss += value * batch_timesteps
+                    accumulated_samples += batch_timesteps
+                    episode_timesteps += batch_timesteps
+                    accumulated += batch_weight
+                completed_epoch = episode_index + 1 == len(current_train_files)
+                if accumulated >= config.gradient_accumulation_steps or (completed_epoch and accumulated > 0):
                     learning_rate, grad_norm = _optimizer_step(trainable, optimizer, accumulated, config, step)
                     step += 1
-                    last_update_loss = accumulated_loss / accumulated
+                    last_update_loss = accumulated_loss / max(1, accumulated_samples)
+                    accumulated = 0.0
+                    accumulated_loss = 0.0
+                    accumulated_samples = 0
                     writer.add_scalar("loss/train", last_update_loss, step)
                     writer.add_scalar("optimization/learning_rate", learning_rate, step)
                     writer.add_scalar("optimization/gradient_norm", grad_norm, step)
 
                 mean_episode_loss = episode_loss / max(1, episode_timesteps)
+                epoch_loss += episode_loss
+                epoch_timesteps += episode_timesteps
                 writer.add_scalar("trajectory/train_mean_loss", mean_episode_loss, step)
                 writer.add_scalar("trajectory/length", episode_timesteps, step)
                 writer.add_scalar("system/peak_vram_gib", torch.cuda.max_memory_allocated(device) / 2**30, step)
@@ -664,20 +724,22 @@ def train(config: TrainConfig) -> None:
                     path.stem, episode_timesteps, step, config.steps, mean_episode_loss, time.perf_counter() - started,
                 )
 
-                validation_due = step >= next_validation_step or step >= config.steps
+                validation_due = (
+                    (validate_each_epoch and completed_epoch)
+                    or (not validate_each_epoch and step >= next_validation_step)
+                    or step >= config.steps
+                )
                 if validation_due:
                     latest_validation_loss = evaluate_trajectories(
                         model, validation_dataset, validation_files, device,
-                        config.validation_batches, action_mask,
+                        config.validation_batches, action_mask, config.validation_noise_seed,
                     )
-                    improved = latest_validation_loss < best_validation_loss - config.early_stopping_min_delta
-                    if improved:
+                    loss_improved = latest_validation_loss < best_validation_loss - config.early_stopping_min_delta
+                    if loss_improved:
                         best_validation_loss = latest_validation_loss
-                        no_improvement_evaluations = 0
                         save_adapter(model, output_dir / "best" / "adapter_model.safetensors")
-                    else:
-                        no_improvement_evaluations += 1
-                    ratio = latest_validation_loss / max(mean_episode_loss, 1e-12)
+                    mean_epoch_loss = epoch_loss / max(1, epoch_timesteps)
+                    ratio = latest_validation_loss / max(mean_epoch_loss, 1e-12)
                     inference_metrics = evaluate_inference_metrics(
                         model,
                         validation_dataset,
@@ -690,24 +752,35 @@ def train(config: TrainConfig) -> None:
                         config.motion_threshold,
                     )
                     motion_z_rmse = inference_metrics.get("physical/moving_z_rmse")
-                    if motion_z_rmse is not None and motion_z_rmse < best_motion_z_rmse:
-                        best_motion_z_rmse = motion_z_rmse
-                        save_adapter(model, output_dir / "best_physical" / "adapter_model.safetensors")
+                    physical_improved = (
+                        loss_improved
+                        if motion_z_rmse is None
+                        else motion_z_rmse < best_motion_z_rmse - config.early_stopping_min_delta
+                    )
+                    if physical_improved:
+                        if motion_z_rmse is not None:
+                            best_motion_z_rmse = motion_z_rmse
+                            save_adapter(model, output_dir / "best_physical" / "adapter_model.safetensors")
+                        no_improvement_evaluations = 0
+                    else:
+                        no_improvement_evaluations += 1
                     writer.add_scalar("loss/validation", latest_validation_loss, step)
                     writer.add_scalar("loss/validation_train_ratio", ratio, step)
                     for metric_name, metric_value in inference_metrics.items():
                         writer.add_scalar(metric_name, metric_value, step)
                     logging.info(
-                        "boundary validation: step=%d validation_loss=%.6f best=%.6f no_improvement=%d/%d",
+                        "epoch validation: step=%d validation_loss=%.6f best_loss=%.6f "
+                        "moving_z_rmse=%s best_moving_z_rmse=%.6f no_physical_improvement=%d/%d",
                         step, latest_validation_loss, best_validation_loss,
+                        "n/a" if motion_z_rmse is None else f"{motion_z_rmse:.6f}",
+                        best_motion_z_rmse,
                         no_improvement_evaluations, config.early_stopping_patience,
                     )
-                    while next_validation_step <= step:
-                        next_validation_step += validation_interval
+                    if not validate_each_epoch:
+                        while next_validation_step <= step:
+                            next_validation_step += validation_interval
                     if no_improvement_evaluations >= config.early_stopping_patience:
-                        stop_reason = "validation loss stopped improving at complete trajectory boundaries"
-                    elif ratio >= config.early_stopping_overfit_ratio and no_improvement_evaluations >= 2:
-                        stop_reason = f"overfitting at trajectory boundary: validation/train ratio={ratio:.3f}"
+                        stop_reason = "validation moving_z_rmse stopped improving across complete epochs"
 
                 save_due = step - last_saved_step >= config.save_interval or validation_due or stop_reason is not None
                 if save_due:

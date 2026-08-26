@@ -2,16 +2,16 @@
 
 set -o pipefail
 
-OUTPUT_DIR="/mnt/data/lcx1/yiqinworkspace/openpi/src/openpi/sft_shiji/output_total/aug05-06-causal-10hz-v2-zonly-$(date +%Y%m%d-%H%M%S)"
+OUTPUT_DIR="/mnt/data/lcx1/yiqinworkspace/openpi/src/openpi/sft_shiji/output_total/aug05-06-image-indexed-v3-zonly-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "${OUTPUT_DIR}"
 
-CUDA_VISIBLE_DEVICES=6 \
+CUDA_VISIBLE_DEVICES=3 \
 UV_CACHE_DIR=/tmp/uv-cache \
 UV_LINK_MODE=copy \
 uv run \
   --project /mnt/data/lcx1/yiqinworkspace/openpi \
   python -m openpi.sft_shiji.train \
-  --hdf5-root /mnt/data/lcx1/yiqinworkspace/openpi/src/openpi/sft_shiji/hdf5_data/2026-08-05-06-command-delta-causal-10hz-v2 \
+  --hdf5-root /mnt/data/lcx1/yiqinworkspace/openpi/src/openpi/sft_shiji/hdf5_data/2026-08-05-06-command-delta-image-indexed-v3 \
   --checkpoint /mnt/data/lcx1/yiqinworkspace/openpi/asset_pi05_base/pytorch \
   --output-dir "${OUTPUT_DIR}" \
   --tensorboard-dir "${OUTPUT_DIR}/tensorboard" \
@@ -21,7 +21,7 @@ uv run \
   --finetune-mode d \
   --mask-non-z-actions \
   --motion-threshold 1e-4 \
-  --balance-motion-samples \
+  --no-balance-motion-samples \
   --max-balance-repeat 8 \
   --action-abs-quantile 0.99 \
   --lora-dropout 0.0 \
@@ -41,7 +41,6 @@ uv run \
   --validation-noise-seed 20260811 \
   --early-stopping-patience 8 \
   --early-stopping-min-delta 1e-4 \
-  --early-stopping-overfit-ratio 1.25 \
   --no-use-robot-state \
   --no-gradient-checkpointing \
   2>&1 | tee "${OUTPUT_DIR}/train.log"

@@ -20,8 +20,17 @@ def inspect_trajectory(path: Path) -> dict:
             raise ValueError(f"{path.name}: anchor timestamps are not strictly increasing")
         states = file["observations/state"]
         actions = file["actions/trajectory"]
+        action_valid_mask = np.asarray(file["actions/valid_mask"], dtype=np.bool_)
         if states.shape[0] != anchors.size or actions.shape[0] != anchors.size:
             raise ValueError(f"{path.name}: state/action length differs from the unified timeline")
+        if action_valid_mask.shape != actions.shape[:2]:
+            raise ValueError(
+                f"{path.name}: action mask shape {action_valid_mask.shape} differs from {actions.shape[:2]}"
+            )
+        if np.any(np.diff(action_valid_mask.astype(np.int8), axis=1) > 0):
+            raise ValueError(f"{path.name}: action valid mask changes from false back to true")
+        if not np.all(action_valid_mask[:, 0]):
+            raise ValueError(f"{path.name}: every anchor must have a valid current action")
         cameras = {}
         for camera_name in CAMERA_TO_MODEL_KEY:
             indices = np.asarray(file[f"observations/image_index/{camera_name}"], dtype=np.int64)
@@ -33,8 +42,14 @@ def inspect_trajectory(path: Path) -> dict:
                 raise ValueError(f"{path.name}/{camera_name}: source image index is out of range")
             selected_timestamps = source_timestamps[indices]
             actual_offsets = selected_timestamps - anchors
-            if not np.array_equal(np.abs(actual_offsets), offsets):
+            if not np.array_equal(-actual_offsets, offsets):
                 raise ValueError(f"{path.name}/{camera_name}: stored camera offsets are inconsistent")
+            if camera_name == "camera_pool" and not np.array_equal(
+                indices, np.arange(len(anchors), dtype=np.int64)
+            ):
+                raise ValueError(f"{path.name}: camera_pool must use every source image exactly once")
+            if np.any(np.diff(indices) < 0):
+                raise ValueError(f"{path.name}/{camera_name}: source indices are not monotonic")
             cameras[camera_name] = {
                 "all_source_images": int(file[f"observations/images/{camera_name}"].shape[0]),
                 "aligned_timesteps": len(indices),
@@ -52,6 +67,8 @@ def inspect_trajectory(path: Path) -> dict:
             "start_timestamp": int(anchors[0]),
             "end_timestamp": int(anchors[-1]),
             "action_shape": list(actions.shape),
+            "valid_action_positions": int(np.count_nonzero(action_valid_mask)),
+            "masked_tail_action_positions": int(action_valid_mask.size - np.count_nonzero(action_valid_mask)),
             "cameras": cameras,
         }
 
@@ -74,7 +91,7 @@ def main() -> None:
         "episode_order": [item["episode_id"] for item in trajectories],
         "shuffle_episodes": False,
         "shuffle_timesteps": False,
-        "camera_policy": "three views share one fixed timeline; missing updates reuse only the previous frame",
+        "camera_policy": "every camera_pool image is an anchor; side cameras reuse the latest available image",
         "trajectories": trajectories,
     }, indent=2, ensure_ascii=False))
 

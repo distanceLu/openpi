@@ -376,6 +376,7 @@ def _infer_trajectory(
     predictions = []
     ground_truth = []
     per_timestep_metrics = []
+    action_valid_masks = []
     timestamps = []
     completed = False
     try:
@@ -399,10 +400,13 @@ def _infer_trajectory(
                     device, observation, num_steps=diffusion_steps, action_mask=action_mask
                 )
                 normalized_action = action[0].float().cpu().numpy()
-                predicted = transform.unnormalize_actions(normalized_action)[..., :6]
+                predicted = transform.unnormalize_actions(normalized_action[..., :6])
                 if action_mask is not None:
                     predicted[..., ~action_mask[:6].cpu().numpy().astype(bool)] = 0.0
                 target = np.asarray(raw["actions"], dtype=np.float32).copy()
+                action_valid_mask = np.asarray(raw.get(
+                    "action_valid_mask", np.ones(target.shape[0], dtype=np.bool_)
+                ), dtype=np.bool_)
                 if action_mask is not None:
                     target[..., ~action_mask[:6].cpu().numpy().astype(bool)] = 0.0
                 if timestep == 0:
@@ -420,15 +424,22 @@ def _infer_trajectory(
                     )
                 for model_key, writer in writers.items():
                     writer.append_data(
-                        _comparison_frame(raw["image"][model_key], predicted, target, timestep)
+                        _comparison_frame(
+                            raw["image"][model_key], predicted[action_valid_mask],
+                            target[action_valid_mask], timestep,
+                        )
                     )
-                metrics = _z_error_metrics(predicted, target, motion_threshold)
+                metrics = _z_error_metrics(
+                    predicted[action_valid_mask], target[action_valid_mask], motion_threshold
+                )
                 predictions.append(predicted)
                 ground_truth.append(target)
+                action_valid_masks.append(action_valid_mask)
                 per_timestep_metrics.append(metrics)
                 timestamps.append(timestep)
                 _print_prediction_comparison(
-                    trajectory_path.stem, timestep, predicted, target, metrics
+                    trajectory_path.stem, timestep,
+                    predicted[action_valid_mask], target[action_valid_mask], metrics,
                 )
                 if timestep % 25 == 0 or timestep + 1 == trajectory.length:
                     print(f"{trajectory_path.stem}: progress={timestep + 1}/{trajectory.length}")
@@ -445,8 +456,9 @@ def _infer_trajectory(
         temporary.replace(final_videos[model_key])
     prediction_array = np.asarray(predictions, dtype=np.float32)
     target_array = np.asarray(ground_truth, dtype=np.float32)
+    valid_mask_array = np.asarray(action_valid_masks, dtype=np.bool_)
     trajectory_metrics = _z_error_metrics(
-        prediction_array.reshape(-1, 6), target_array.reshape(-1, 6), motion_threshold
+        prediction_array[valid_mask_array], target_array[valid_mask_array], motion_threshold
     )
     print(
         f"{trajectory_path.stem}: TRAJECTORY SUMMARY "
@@ -458,6 +470,7 @@ def _infer_trajectory(
     )
     np.save(episode_output / "predicted_actions.npy", prediction_array)
     np.save(episode_output / "ground_truth_actions.npy", target_array)
+    np.save(episode_output / "action_valid_mask.npy", valid_mask_array)
     np.save(episode_output / "timesteps.npy", np.asarray(timestamps, dtype=np.int64))
     (episode_output / "relative_error_metrics.json").write_text(json.dumps({
         "definition": {
@@ -471,6 +484,7 @@ def _infer_trajectory(
                 "mean(abs(pred_z) >= motion_threshold for stationary targets)"
             ),
             "aggregation": "episode timesteps and action-horizon steps are flattened",
+            "tail_policy": "only action_valid_mask=true positions contribute to metrics",
         },
         "action_space": "physical relative-pose z delta after quantile unnormalization",
         "units": {"z": "same length unit as tool_pose.csv"},
@@ -488,6 +502,8 @@ def _infer_trajectory(
         "predicted_action_shape": list(prediction_array.shape),
         "predicted_action_space": "physical relative-pose z delta after quantile unnormalization",
         "ground_truth_action_shape": list(target_array.shape),
+        "valid_action_positions": int(np.count_nonzero(valid_mask_array)),
+        "masked_tail_action_positions": int(valid_mask_array.size - np.count_nonzero(valid_mask_array)),
         "trained_action_axes": ["z"],
         "disabled_action_axes": ["x", "y", "rx", "ry", "rz"],
         "motion_threshold": motion_threshold,
@@ -507,7 +523,7 @@ def main() -> None:
     parser.add_argument("--norm-stats", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--prompt", default="follow the demonstrated robot tool trajectory")
-    parser.add_argument("--fps", type=float, default=10.0)
+    parser.add_argument("--fps", type=float, default=20.0)
     parser.add_argument("--diffusion-steps", type=int, default=10)
     parser.add_argument(
         "--motion-threshold",
