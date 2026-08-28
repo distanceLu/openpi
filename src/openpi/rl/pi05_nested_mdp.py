@@ -7,8 +7,11 @@ import torch
 
 from openpi.models_pytorch.pi0_pytorch import make_att_2d_masks
 from openpi.rl.pi05_action_head import Pi05GaussianActionHead
-from openpi.rl.pi05_denoising import make_denoise_timesteps, normal_logprob, pi05_flow_step_mean_std
-from openpi.rl.pi05_types import Pi05LogProbOutput, Pi05RolloutOutput
+from openpi.rl.pi05_denoising import make_denoise_timesteps
+from openpi.rl.pi05_denoising import normal_logprob
+from openpi.rl.pi05_denoising import pi05_flow_step_mean_std
+from openpi.rl.pi05_types import Pi05LogProbOutput
+from openpi.rl.pi05_types import Pi05RolloutOutput
 from openpi.rl.value_head import attach_pi05_value_head
 
 
@@ -48,6 +51,10 @@ class Pi05NestedMDP:
             raise ValueError("Pi05NestedMDP requires a pi0.5 model with model.pi05=True")
         if self.config.sample_method not in ("flow_ode", "flow_sde", "flow_cps", "flow_noise"):
             raise ValueError(f"Unknown pi0.5 sample_method: {self.config.sample_method}")
+        if self.config.noise_level < 0:
+            raise ValueError("noise_level must be non-negative")
+        if self.config.sample_method in ("flow_sde", "flow_cps") and self.config.noise_level <= 0:
+            raise ValueError(f"{self.config.sample_method} requires noise_level > 0")
         if self.config.sample_method == "flow_noise":
             if not self.config.learned_action_head:
                 raise ValueError("flow_noise requires learned_action_head=True")
@@ -60,12 +67,16 @@ class Pi05NestedMDP:
             action_head_parameters = list(action_head.parameters())
             if not action_head_parameters:
                 raise ValueError("model.rl_action_head must have parameters")
-            if self.config.require_trainable_heads and not all(parameter.requires_grad for parameter in action_head_parameters):
+            if self.config.require_trainable_heads and not all(
+                parameter.requires_grad for parameter in action_head_parameters
+            ):
                 raise ValueError("Every model.rl_action_head parameter must be trainable so transition std can learn")
         velocity_head_parameters = list(self.model.action_out_proj.parameters())
         if not velocity_head_parameters:
             raise ValueError("model.action_out_proj must have parameters")
-        if self.config.require_trainable_heads and not all(parameter.requires_grad for parameter in velocity_head_parameters):
+        if self.config.require_trainable_heads and not all(
+            parameter.requires_grad for parameter in velocity_head_parameters
+        ):
             raise ValueError("Every model.action_out_proj parameter must be trainable so transition mean can learn")
         if self.config.require_value_head:
             attach_pi05_value_head(
@@ -89,6 +100,8 @@ class Pi05NestedMDP:
     ) -> Pi05RolloutOutput:
         """Run the full inner denoising MDP and save every transition."""
 
+        sample_method = self._sample_method_for_mode(mode)
+        deterministic = self._deterministic(mode)
         cache = self._build_prefix_cache(observation, train=False)
         state = cache["state"]
         bsz = state.shape[0]
@@ -129,11 +142,11 @@ class Pi05NestedMDP:
                 suffix_out=suffix_out,
                 timestep=timestep,
                 delta=delta,
-                sample_method=self._sample_method_for_mode(mode),
+                sample_method=sample_method,
                 timesteps=timesteps,
                 step_index=step_index,
             )
-            x_next = mean if self._deterministic(mode) else mean + self.model.sample_noise(mean.shape, mean.device) * std
+            x_next = mean if deterministic else mean + self.model.sample_noise(mean.shape, mean.device) * std
             logprob = normal_logprob(x_next, mean, std)
 
             chains.append(x_next)
@@ -330,10 +343,13 @@ class Pi05NestedMDP:
         return self.model.value_head(cache["prefix_hidden_states"], cache["prefix_pad_masks"])
 
     def _sample_method_for_mode(self, mode: str) -> str:
+        if mode not in ("train", "eval"):
+            raise ValueError(f"Unknown pi0.5 rollout mode: {mode!r}")
         if mode == "eval" and self.config.deterministic_eval:
             return "flow_ode"
+        if self.config.sample_method == "flow_ode":
+            raise ValueError("flow_ode is only allowed for deterministic evaluation")
         return self.config.sample_method
 
     def _deterministic(self, mode: str) -> bool:
         return mode == "eval" and self.config.deterministic_eval
-
