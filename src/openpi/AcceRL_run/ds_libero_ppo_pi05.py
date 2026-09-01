@@ -4,10 +4,9 @@ The outer MDP is a LIBERO environment transition.  The inner MDP is the full
 pi0.5 denoising chain that produces one action chunk.  Rewards and GAE belong
 to outer transitions; PPO log-probability ratios belong to saved inner paths.
 
-First-version scope: one DeepSpeed trainer, one inference actor, one LIBERO
-task, path-level PPO plus an outer value loss.  The Ray/DeepSpeed split and
-weight broadcast are retained so this is a real AcceRL integration rather than
-a standalone pi0.5 training loop.
+The runner retains AcceRL's asynchronous actor/learner split while bounding
+off-policy drift through fresh replay sampling, behavior-policy KL, current
+value recomputation, and actor/critic learning-rate schedules.
 """
 
 from __future__ import annotations
@@ -21,7 +20,6 @@ from datetime import datetime
 import json
 import os
 from pathlib import Path
-import random
 import socket
 import time
 from typing import TYPE_CHECKING, Any
@@ -31,6 +29,8 @@ os.environ.setdefault("PYOPENGL_PLATFORM", "osmesa")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("RAY_DEDUP_LOGS", "0")
 
+from accerl_math import compute_smdp_gae
+from accerl_math import warmup_cosine_lr_scale
 import numpy as np
 from pi05_ds_com import InferenceActorCom
 from pi05_ds_com import TrainerActorCom
@@ -49,6 +49,7 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 
 from openpi.rl.pi05_denoising import normal_entropy
+from openpi.rl.pi05_losses import compute_diagonal_gaussian_kl_loss
 from openpi.rl.pi05_losses import compute_pi05_ppo_loss
 from openpi.rl.pi05_losses import compute_value_loss
 
@@ -128,16 +129,38 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--accumulation-steps", type=int, default=4)
     parser.add_argument("--rollout-local-buf", type=int, default=8)
     parser.add_argument("--replay-capacity", type=int, default=512)
+    parser.add_argument(
+        "--max-policy-lag",
+        type=int,
+        default=8,
+        help="Discard trajectories containing samples older than this many policy versions; 0 disables filtering.",
+    )
+    parser.add_argument(
+        "--max-sample-reuse",
+        type=int,
+        default=1,
+        help="Maximum training selections per trajectory; 0 allows unlimited replay.",
+    )
     parser.add_argument("--train-iters", type=int, default=1000)
     parser.add_argument("--policy-lr", type=float, default=1e-5)
     parser.add_argument("--value-lr", type=float, default=1e-4)
+    parser.add_argument("--policy-warmup-steps", type=int, default=50)
+    parser.add_argument("--value-warmup-steps", type=int, default=50)
+    parser.add_argument("--lr-schedule", choices=["constant", "cosine"], default="cosine")
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--gae-lambda", type=float, default=0.95)
     parser.add_argument("--clip-eps", type=float, default=0.2)
     parser.add_argument("--value-coef", type=float, default=0.5)
     parser.add_argument("--entropy-coef", type=float, default=0.0)
-    parser.add_argument("--path-logprob-reduce", choices=["mean", "sum"], default="mean")
+    parser.add_argument("--kl-coef", type=float, default=0.01)
+    parser.add_argument("--path-logprob-reduce", choices=["mean", "sum"], default="sum")
     parser.add_argument("--log-ratio-clip", type=float, default=20.0)
+    parser.add_argument(
+        "--recompute-value",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Recompute current V(s) and bootstrap values before GAE.",
+    )
     parser.add_argument("--use-bf16", action=argparse.BooleanOptionalAction, default=True)
 
     parser.add_argument("--exp-name", default="pi05_accerl_v1")
@@ -176,6 +199,8 @@ class Trajectory:
     observations: list[model_types.Observation[torch.Tensor]]
     chains: np.ndarray
     old_logprobs: np.ndarray
+    old_means: np.ndarray
+    old_stds: np.ndarray
     denoise_timesteps: np.ndarray
     denoise_indices: np.ndarray
     old_velocities: np.ndarray
@@ -183,9 +208,11 @@ class Trajectory:
     old_values: np.ndarray
     durations: np.ndarray
     bootstrap_value: float
+    bootstrap_observation: model_types.Observation[torch.Tensor] | None
     is_terminal: bool
     policy_versions: np.ndarray
     insert_times_ms: np.ndarray
+    sample_uses: int = 0
 
     @property
     def num_steps(self) -> int:
@@ -220,16 +247,20 @@ class StatsActor:
 
 @ray.remote
 class ReplayBufferActor:
-    """Trajectory replay buffer following the original AcceRL sampling semantics."""
+    """Freshness-aware trajectory replay for asynchronous PPO."""
 
     def __init__(self, capacity: int):
         # Keep capacity in trajectories, matching ds_libero_ppo_discrete.py.
         self.trajectories: deque[Trajectory] = deque(maxlen=int(capacity))
+        self.total_added = 0
+        self.total_sampled = 0
+        self.total_stale_discarded = 0
 
     def add_trajectory(self, trajectory: Trajectory) -> None:
         if trajectory.num_steps <= 0:
             return
         self.trajectories.append(trajectory)
+        self.total_added += 1
 
     def total_steps(self) -> int:
         return sum(trajectory.num_steps for trajectory in self.trajectories)
@@ -237,20 +268,66 @@ class ReplayBufferActor:
     def size(self) -> int:
         return len(self.trajectories)
 
-    def sample_trajectories(self, minimum_steps: int) -> list[Trajectory]:
+    def sample_trajectories(
+        self,
+        minimum_steps: int,
+        current_policy_version: int,
+        max_policy_lag: int,
+        max_sample_reuse: int,
+    ) -> list[Trajectory]:
         if not self.trajectories:
             return []
+
+        def is_fresh(trajectory: Trajectory) -> bool:
+            if max_policy_lag <= 0:
+                return True
+            oldest_version = int(np.min(trajectory.policy_versions))
+            return current_policy_version - oldest_version <= max_policy_lag
+
+        fresh: list[Trajectory] = []
+        for trajectory in self.trajectories:
+            if is_fresh(trajectory):
+                fresh.append(trajectory)
+            else:
+                self.total_stale_discarded += 1
+        self.trajectories = deque(fresh, maxlen=self.trajectories.maxlen)
+        if not fresh:
+            return []
+
         selected: list[Trajectory] = []
         selected_steps = 0
-        indices = list(range(len(self.trajectories)))
-        random.shuffle(indices)
-        for index in indices:
-            trajectory = self.trajectories[index]
+        # Prefer newest data; random order is actively harmful when the learner
+        # can update faster than rollout workers produce trajectories.
+        candidates = sorted(fresh, key=lambda item: int(np.max(item.insert_times_ms)), reverse=True)
+        for trajectory in candidates:
             selected.append(trajectory)
             selected_steps += trajectory.num_steps
             if selected_steps >= minimum_steps:
                 break
+        if selected_steps < minimum_steps:
+            return []
+
+        selected_ids = {id(trajectory) for trajectory in selected}
+        retained: list[Trajectory] = []
+        for trajectory in self.trajectories:
+            if id(trajectory) not in selected_ids:
+                retained.append(trajectory)
+                continue
+            trajectory.sample_uses += 1
+            self.total_sampled += 1
+            if max_sample_reuse <= 0 or trajectory.sample_uses < max_sample_reuse:
+                retained.append(trajectory)
+        self.trajectories = deque(retained, maxlen=self.trajectories.maxlen)
         return selected
+
+    def get_stats(self) -> dict[str, float]:
+        return {
+            "replay/trajectories": float(len(self.trajectories)),
+            "replay/outer_steps": float(self.total_steps()),
+            "replay/total_added": float(self.total_added),
+            "replay/total_sampled": float(self.total_sampled),
+            "replay/stale_discarded": float(self.total_stale_discarded),
+        }
 
 
 def _reset_env(env: Any) -> dict[str, Any]:
@@ -364,6 +441,8 @@ class InferenceActor(InferenceActorCom):
             "normalized_actions": rollout.actions[batch_index].cpu().float().numpy(),
             "chains": rollout.chains[batch_index].cpu().float().numpy(),
             "old_logprobs": rollout.denoise_logprobs[batch_index].cpu().float().numpy(),
+            "old_means": rollout.denoise_means[batch_index].cpu().float().numpy(),
+            "old_stds": rollout.denoise_stds[batch_index].cpu().float().numpy(),
             "denoise_timesteps": rollout.denoise_timesteps[batch_index].cpu().float().numpy(),
             "denoise_indices": rollout.denoise_indices[batch_index].cpu().numpy(),
             "old_velocities": rollout.velocities[batch_index].cpu().float().numpy(),
@@ -485,6 +564,8 @@ class RolloutWorkerActor:
                         "observation": model_observation,
                         "chains": inference["chains"],
                         "old_logprobs": inference["old_logprobs"],
+                        "old_means": inference["old_means"],
+                        "old_stds": inference["old_stds"],
                         "denoise_timesteps": inference["denoise_timesteps"],
                         "denoise_indices": inference["denoise_indices"],
                         "old_velocities": inference["old_velocities"],
@@ -499,8 +580,21 @@ class RolloutWorkerActor:
                 episode_done = terminated or truncated or episode_length >= self.max_episode_steps
 
                 if episode_done:
+                    # True termination has no bootstrap. Gym truncation and
+                    # our time limit remain valid MDP states and must bootstrap.
+                    is_terminal = bool(terminated)
+                    bootstrap_observation = None
+                    bootstrap_value = 0.0
+                    if not is_terminal:
+                        bootstrap_observation = prepare_one_obs(self.adapter, next_observation, self.task_description)
+                        bootstrap_value = ray.get(self.inference_actor.value.remote(bootstrap_observation))
                     self.replay_buffer.add_trajectory.remote(
-                        _pack_trajectory(segment, bootstrap_value=0.0, is_terminal=True)
+                        _pack_trajectory(
+                            segment,
+                            bootstrap_value=bootstrap_value,
+                            bootstrap_observation=bootstrap_observation,
+                            is_terminal=is_terminal,
+                        )
                     )
                     segment = []
                 elif len(segment) == self.rollout_local_buf + 1:
@@ -512,6 +606,7 @@ class RolloutWorkerActor:
                         _pack_trajectory(
                             segment[:-1],
                             bootstrap_value=bootstrap_value,
+                            bootstrap_observation=segment[-1]["observation"],
                             is_terminal=False,
                         )
                     )
@@ -526,12 +621,15 @@ class RolloutWorkerActor:
 def _pack_trajectory(
     segment: list[dict[str, Any]],
     bootstrap_value: float,
+    bootstrap_observation: model_types.Observation[torch.Tensor] | None,
     is_terminal: bool,
 ) -> Trajectory:
     return Trajectory(
         observations=[item["observation"] for item in segment],
         chains=np.stack([item["chains"] for item in segment]).astype(np.float32),
         old_logprobs=np.stack([item["old_logprobs"] for item in segment]).astype(np.float32),
+        old_means=np.stack([item["old_means"] for item in segment]).astype(np.float32),
+        old_stds=np.stack([item["old_stds"] for item in segment]).astype(np.float32),
         denoise_timesteps=np.stack([item["denoise_timesteps"] for item in segment]).astype(np.float32),
         denoise_indices=np.stack([item["denoise_indices"] for item in segment]).astype(np.int64),
         old_velocities=np.stack([item["old_velocities"] for item in segment]).astype(np.float32),
@@ -539,6 +637,7 @@ def _pack_trajectory(
         old_values=np.asarray([item["old_value"] for item in segment], dtype=np.float32),
         durations=np.asarray([item["duration"] for item in segment], dtype=np.int64),
         bootstrap_value=float(bootstrap_value),
+        bootstrap_observation=bootstrap_observation,
         is_terminal=bool(is_terminal),
         policy_versions=np.asarray([item["policy_version"] for item in segment], dtype=np.int64),
         insert_times_ms=np.asarray([item["insert_time_ms"] for item in segment], dtype=np.int64),
@@ -557,13 +656,21 @@ class TrainerActor(TrainerActorCom):
         accumulation_steps: int,
         policy_lr: float,
         value_lr: float,
+        policy_warmup_steps: int,
+        value_warmup_steps: int,
+        lr_schedule: str,
+        train_iters: int,
         gamma: float,
         gae_lambda: float,
         clip_eps: float,
         value_coef: float,
         entropy_coef: float,
+        kl_coef: float,
         path_logprob_reduce: str,
         log_ratio_clip: float,
+        recompute_value: bool,
+        max_policy_lag: int,
+        max_sample_reuse: int,
         use_bf16: bool,
     ):
         super().__init__()
@@ -576,13 +683,21 @@ class TrainerActor(TrainerActorCom):
         self.super_batch_size = train_batch_size * accumulation_steps
         self.policy_lr = policy_lr
         self.value_lr = value_lr
+        self.policy_warmup_steps = policy_warmup_steps
+        self.value_warmup_steps = value_warmup_steps
+        self.lr_schedule = lr_schedule
+        self.train_iters = train_iters
         self.gamma = gamma
         self.gae_lambda = gae_lambda
         self.clip_eps = clip_eps
         self.value_coef = value_coef
         self.entropy_coef = entropy_coef
+        self.kl_coef = kl_coef
         self.path_logprob_reduce = path_logprob_reduce
         self.log_ratio_clip = log_ratio_clip
+        self.recompute_value = recompute_value
+        self.max_policy_lag = max_policy_lag
+        self.max_sample_reuse = max_sample_reuse
         self.use_bf16 = use_bf16
         self.global_step = 0
         self.policy_version = 0
@@ -635,37 +750,67 @@ class TrainerActor(TrainerActorCom):
         return summary
 
     def run_training_epoch(self) -> dict[str, float]:
-        while ray.get(self.replay_buffer.total_steps.remote()) < self.super_batch_size:
+        trajectories: list[Trajectory] = []
+        while not trajectories:
+            trajectories = ray.get(
+                self.replay_buffer.sample_trajectories.remote(
+                    self.super_batch_size,
+                    self.policy_version,
+                    self.max_policy_lag,
+                    self.max_sample_reuse,
+                )
+            )
+            if trajectories:
+                break
             time.sleep(0.5)
-        trajectories = ray.get(self.replay_buffer.sample_trajectories.remote(self.super_batch_size))
         batch = self._flatten_trajectories(trajectories)
         metrics = self._train_super_batch(batch)
         metrics["global_step"] = float(self.global_step)
         metrics["policy_version"] = float(self.policy_version)
         return metrics
 
-    def _compute_gae(self, trajectory: Trajectory) -> tuple[np.ndarray, np.ndarray]:
-        advantages = np.zeros(trajectory.num_steps, dtype=np.float32)
-        gae = 0.0
-        for index in reversed(range(trajectory.num_steps)):
-            if index == trajectory.num_steps - 1:
-                next_value = 0.0 if trajectory.is_terminal else trajectory.bootstrap_value
-            else:
-                next_value = float(trajectory.old_values[index + 1])
-            duration = int(trajectory.durations[index])
-            discount = self.gamma**duration
-            trace_discount = (self.gamma * self.gae_lambda) ** duration
-            delta = float(trajectory.rewards[index]) + discount * next_value - float(trajectory.old_values[index])
-            gae = delta + trace_discount * gae
-            advantages[index] = gae
-        returns = advantages + trajectory.old_values
-        return advantages, returns.astype(np.float32)
+    def _compute_current_values(self, observations: list[model_types.Observation[torch.Tensor]]) -> np.ndarray:
+        if not observations:
+            return np.empty((0,), dtype=np.float32)
+        values: list[np.ndarray] = []
+        was_training = self.base_model.training
+        self.base_model.eval()
+        with torch.no_grad():
+            for start in range(0, len(observations), self.train_batch_size):
+                observation_batch = prepare_inputs_batch(
+                    self.adapter, observations[start : start + self.train_batch_size]
+                )
+                batch_values = self.nested_mdp.compute_value(observation_batch)
+                values.append(batch_values.detach().cpu().float().numpy())
+        if was_training:
+            self.base_model.train()
+        return np.concatenate(values, axis=0).astype(np.float32)
+
+    def _compute_gae(
+        self,
+        trajectory: Trajectory,
+        values: np.ndarray | None = None,
+        bootstrap_value: float | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        selected_values = trajectory.old_values if values is None else values
+        selected_bootstrap = trajectory.bootstrap_value if bootstrap_value is None else bootstrap_value
+        return compute_smdp_gae(
+            trajectory.rewards,
+            selected_values,
+            trajectory.durations,
+            bootstrap_value=selected_bootstrap,
+            is_terminal=trajectory.is_terminal,
+            gamma=self.gamma,
+            gae_lambda=self.gae_lambda,
+        )
 
     def _flatten_trajectories(self, trajectories: list[Trajectory]) -> dict[str, Any]:
         observations: list[model_types.Observation[torch.Tensor]] = []
         arrays: dict[str, list[np.ndarray]] = {
             "chains": [],
             "old_logprobs": [],
+            "old_means": [],
+            "old_stds": [],
             "denoise_timesteps": [],
             "denoise_indices": [],
             "old_velocities": [],
@@ -674,11 +819,43 @@ class TrainerActor(TrainerActorCom):
             "advantages": [],
             "returns": [],
         }
-        for trajectory in trajectories:
-            advantages, returns = self._compute_gae(trajectory)
+        current_values: list[np.ndarray] | None = None
+        current_bootstraps: list[float] | None = None
+        if self.recompute_value:
+            value_observations = [observation for trajectory in trajectories for observation in trajectory.observations]
+            flat_values = self._compute_current_values(value_observations)
+            current_values = []
+            offset = 0
+            for trajectory in trajectories:
+                current_values.append(flat_values[offset : offset + trajectory.num_steps])
+                offset += trajectory.num_steps
+
+            bootstrap_observations = [
+                trajectory.bootstrap_observation
+                for trajectory in trajectories
+                if not trajectory.is_terminal and trajectory.bootstrap_observation is not None
+            ]
+            flat_bootstraps = self._compute_current_values(bootstrap_observations)
+            bootstrap_index = 0
+            current_bootstraps = []
+            for trajectory in trajectories:
+                if trajectory.is_terminal:
+                    current_bootstraps.append(0.0)
+                elif trajectory.bootstrap_observation is not None:
+                    current_bootstraps.append(float(flat_bootstraps[bootstrap_index]))
+                    bootstrap_index += 1
+                else:
+                    current_bootstraps.append(float(trajectory.bootstrap_value))
+
+        for trajectory_index, trajectory in enumerate(trajectories):
+            values = None if current_values is None else current_values[trajectory_index]
+            bootstrap = None if current_bootstraps is None else current_bootstraps[trajectory_index]
+            advantages, returns = self._compute_gae(trajectory, values, bootstrap)
             observations.extend(trajectory.observations)
             arrays["chains"].append(trajectory.chains)
             arrays["old_logprobs"].append(trajectory.old_logprobs)
+            arrays["old_means"].append(trajectory.old_means)
+            arrays["old_stds"].append(trajectory.old_stds)
             arrays["denoise_timesteps"].append(trajectory.denoise_timesteps)
             arrays["denoise_indices"].append(trajectory.denoise_indices)
             arrays["old_velocities"].append(trajectory.old_velocities)
@@ -692,15 +869,37 @@ class TrainerActor(TrainerActorCom):
         flattened["observations"] = observations[:limit]
         return flattened
 
+    def _update_learning_rates(self) -> dict[str, float]:
+        if self.lr_schedule == "constant":
+            policy_scale = value_scale = 1.0
+        else:
+            policy_scale = warmup_cosine_lr_scale(self.global_step, self.policy_warmup_steps, self.train_iters)
+            value_scale = warmup_cosine_lr_scale(self.global_step, self.value_warmup_steps, self.train_iters)
+        learning_rates = {
+            "optim/policy_lr": self.policy_lr * policy_scale,
+            "optim/value_lr": self.value_lr * value_scale,
+        }
+        for parameter_group in self.optimizer.param_groups:
+            name = parameter_group.get("name")
+            if name == "policy":
+                parameter_group["lr"] = learning_rates["optim/policy_lr"]
+            elif name == "value":
+                parameter_group["lr"] = learning_rates["optim/value_lr"]
+        return learning_rates
+
     def _train_super_batch(self, batch: dict[str, Any]) -> dict[str, float]:
         device = next(self.base_model.parameters()).device
         count = len(batch["observations"])
+        learning_rates = self._update_learning_rates()
         order = np.random.permutation(count)
         advantages = torch.from_numpy(batch["advantages"]).to(device=device, dtype=torch.float32)
         advantages = (advantages - advantages.mean()) / advantages.std(unbiased=False).clamp_min(1e-8)
 
         metric_rows: list[dict[str, float]] = []
-        self.base_model.train()
+        # Rollout actors keep the behavior model in eval mode. Gradients still
+        # flow in eval mode, and matching dropout/mode semantics is essential
+        # for a meaningful current-vs-behavior likelihood ratio.
+        self.base_model.eval()
         for start in range(0, count, self.train_batch_size):
             indices_np = order[start : start + self.train_batch_size]
             if len(indices_np) != self.train_batch_size:
@@ -712,6 +911,8 @@ class TrainerActor(TrainerActorCom):
             )
             chains = torch.from_numpy(batch["chains"][indices_np]).to(device=device)
             old_logprobs = torch.from_numpy(batch["old_logprobs"][indices_np]).to(device=device)
+            old_means = torch.from_numpy(batch["old_means"][indices_np]).to(device=device)
+            old_stds = torch.from_numpy(batch["old_stds"][indices_np]).to(device=device)
             denoise_timesteps = torch.from_numpy(batch["denoise_timesteps"][indices_np]).to(device=device)
             denoise_indices = torch.from_numpy(batch["denoise_indices"][indices_np]).to(device=device)
             returns = torch.from_numpy(batch["returns"][indices_np]).to(device=device)
@@ -738,8 +939,19 @@ class TrainerActor(TrainerActorCom):
                 path_logprob_reduce=self.path_logprob_reduce,
             )
             value_loss = compute_value_loss(recomputed.values, returns)
+            behavior_kl = compute_diagonal_gaussian_kl_loss(
+                old_means=old_means,
+                old_stds=old_stds,
+                new_means=recomputed.means,
+                new_stds=recomputed.stds,
+            )
             entropy_mean = entropy.float().mean()
-            total_loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy_mean
+            total_loss = (
+                policy_loss
+                + self.value_coef * value_loss
+                - self.entropy_coef * entropy_mean
+                + self.kl_coef * behavior_kl
+            )
 
             update_boundary = self.model.is_gradient_accumulation_boundary()
             self.model.backward(total_loss)
@@ -753,6 +965,7 @@ class TrainerActor(TrainerActorCom):
                     "loss/total": float(total_loss.detach().cpu()),
                     "loss/policy": float(policy_loss.detach().cpu()),
                     "loss/value": float(value_loss.detach().cpu()),
+                    "loss/behavior_kl": float(behavior_kl.detach().cpu()),
                     "policy/entropy": float(entropy_mean.detach().cpu()),
                     "policy/approx_kl": float(ppo_metrics.approx_kl.detach().cpu()),
                     "policy/clip_fraction": float(ppo_metrics.clip_fraction.detach().cpu()),
@@ -763,11 +976,16 @@ class TrainerActor(TrainerActorCom):
         if not metric_rows:
             raise RuntimeError("No complete pi0.5 PPO minibatch was produced")
         metrics = {key: float(np.mean([row[key] for row in metric_rows])) for key in metric_rows[0]}
+        metrics.update(learning_rates)
         policy_versions = batch["policy_versions"].astype(np.int64)
-        metrics["rollout/version_lag_mean"] = float(np.maximum(self.policy_version - policy_versions, 0).mean())
-        metrics["rollout/sample_age_ms_mean"] = float(
-            np.maximum(int(time.time() * 1000) - batch["insert_times_ms"], 0).mean()
-        )
+        version_lags = np.maximum(self.policy_version - policy_versions, 0)
+        sample_ages = np.maximum(int(time.time() * 1000) - batch["insert_times_ms"], 0)
+        metrics["rollout/version_lag_mean"] = float(version_lags.mean())
+        metrics["rollout/version_lag_p95"] = float(np.quantile(version_lags, 0.95))
+        metrics["rollout/version_lag_max"] = float(version_lags.max())
+        metrics["rollout/sample_age_ms_mean"] = float(sample_ages.mean())
+        metrics["rollout/sample_age_ms_p95"] = float(np.quantile(sample_ages, 0.95))
+        metrics["rollout/sample_age_ms_max"] = float(sample_ages.max())
         return metrics
 
     def save_checkpoint(self, checkpoint_dir: str, step: int) -> str:
@@ -807,6 +1025,16 @@ def _validate_first_version_args(args: argparse.Namespace) -> None:
         raise ValueError("train_batch_size and accumulation_steps must be positive")
     if args.rollout_local_buf <= 0:
         raise ValueError("rollout_local_buf must be positive")
+    if args.replay_capacity <= 0:
+        raise ValueError("replay_capacity must be positive")
+    if args.max_policy_lag < 0 or args.max_sample_reuse < 0:
+        raise ValueError("max_policy_lag and max_sample_reuse must be non-negative")
+    if args.kl_coef < 0:
+        raise ValueError("kl_coef must be non-negative")
+    if not 0 <= args.policy_warmup_steps < args.train_iters:
+        raise ValueError("policy_warmup_steps must be in [0, train_iters)")
+    if not 0 <= args.value_warmup_steps < args.train_iters:
+        raise ValueError("value_warmup_steps must be in [0, train_iters)")
     rollout_python = Path(args.rollout_python)
     if not rollout_python.is_file():
         raise FileNotFoundError(f"Rollout Python executable not found: {rollout_python}")
@@ -849,13 +1077,21 @@ def main(args: argparse.Namespace) -> None:
         accumulation_steps=args.accumulation_steps,
         policy_lr=args.policy_lr,
         value_lr=args.value_lr,
+        policy_warmup_steps=args.policy_warmup_steps,
+        value_warmup_steps=args.value_warmup_steps,
+        lr_schedule=args.lr_schedule,
+        train_iters=args.train_iters,
         gamma=args.gamma,
         gae_lambda=args.gae_lambda,
         clip_eps=args.clip_eps,
         value_coef=args.value_coef,
         entropy_coef=args.entropy_coef,
+        kl_coef=args.kl_coef,
         path_logprob_reduce=args.path_logprob_reduce,
         log_ratio_clip=args.log_ratio_clip,
+        recompute_value=args.recompute_value,
+        max_policy_lag=args.max_policy_lag,
+        max_sample_reuse=args.max_sample_reuse,
         use_bf16=args.use_bf16,
     )
     inference_actor = InferenceActor.remote(
@@ -958,13 +1194,14 @@ def main(args: argparse.Namespace) -> None:
             )
             metrics["system/train_and_sync_seconds"] = time.time() - started_at
             metrics.update(ray.get(stats_actor.get_stats.remote()))
-            metrics["replay/outer_steps"] = float(ray.get(replay_buffer.total_steps.remote()))
+            metrics.update(ray.get(replay_buffer.get_stats.remote()))
 
             if global_step % args.log_every_steps == 0:
                 print(
                     f"step={global_step} total={metrics['loss/total']:.5f} "
                     f"policy={metrics['loss/policy']:.5f} value={metrics['loss/value']:.5f} "
-                    f"kl={metrics['policy/approx_kl']:.5f} "
+                    f"kl={metrics['loss/behavior_kl']:.5f} "
+                    f"lag={metrics['rollout/version_lag_mean']:.1f} "
                     f"return={metrics['rollout/return_mean']:.3f}",
                     flush=True,
                 )

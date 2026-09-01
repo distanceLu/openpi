@@ -5,7 +5,6 @@ from typing import Literal
 
 import torch
 
-
 PPOLossMode = Literal["element", "path", "path_and_element"]
 PathLogprobReduceMode = Literal["mean", "sum"]
 
@@ -255,11 +254,9 @@ def _compute_path_ppo_loss(
             entropy.to(device=new_logprobs.device, dtype=torch.float32),
             torch.zeros_like(new_logprobs),
         ).reshape(new_logprobs.shape[0], -1)
-        entropy_value = (
-            torch.where(valid_path_mask, flat_entropy.sum(dim=1) / valid_per_path, torch.zeros_like(valid_per_path))
-            .sum()
-            / valid_path_mask.count_nonzero().clamp_min(1).to(new_logprobs.dtype)
-        )
+        entropy_value = torch.where(
+            valid_path_mask, flat_entropy.sum(dim=1) / valid_per_path, torch.zeros_like(valid_per_path)
+        ).sum() / valid_path_mask.count_nonzero().clamp_min(1).to(new_logprobs.dtype)
 
     with torch.no_grad():
         metrics = _ratio_metrics(log_ratio, ratio, valid_path_mask, clip_eps)
@@ -339,3 +336,29 @@ def compute_reference_kl_loss(
         return logprob_diff.mean()
     mask = _expand_mask(loss_mask, logprob_diff)
     return _masked_mean(logprob_diff, mask)
+
+
+def compute_diagonal_gaussian_kl_loss(
+    old_means: torch.Tensor,
+    old_stds: torch.Tensor,
+    new_means: torch.Tensor,
+    new_stds: torch.Tensor,
+    loss_mask: torch.Tensor | None = None,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Mean KL(old || new) for saved diagonal-Gaussian denoise transitions."""
+
+    new_means = new_means.float()
+    new_stds = new_stds.float().clamp_min(eps)
+    old_means = old_means.to(device=new_means.device, dtype=torch.float32)
+    old_stds = old_stds.to(device=new_means.device, dtype=torch.float32).clamp_min(eps)
+    if not (old_means.shape == old_stds.shape == new_means.shape == new_stds.shape):
+        raise ValueError("old/new Gaussian means and stds must have identical shapes")
+    kl = (
+        torch.log(new_stds / old_stds)
+        + (old_stds.square() + (old_means - new_means).square()) / (2.0 * new_stds.square())
+        - 0.5
+    )
+    if loss_mask is None:
+        return kl.mean()
+    return _masked_mean(kl, _expand_mask(loss_mask, kl))
