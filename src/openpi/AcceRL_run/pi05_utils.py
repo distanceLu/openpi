@@ -10,18 +10,17 @@ from __future__ import annotations
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 import torch
 
-from openpi.models import model as model_types
-from openpi.rl.libero_adapter import Pi05LiberoRLAdapter
-from openpi.rl.pi05_action_head import Pi05GaussianActionHead
-from openpi.rl.pi05_nested_mdp import Pi05NestedMDP
-from openpi.rl.pi05_nested_mdp import Pi05NestedMDPConfig
-from openpi.rl.pi05_types import Pi05LogProbOutput
-from openpi.rl.pi05_types import Pi05RolloutOutput
+if TYPE_CHECKING:
+    from openpi.models import model as model_types
+    from openpi.rl.libero_adapter import Pi05LiberoRLAdapter
+    from openpi.rl.pi05_nested_mdp import Pi05NestedMDP
+    from openpi.rl.pi05_types import Pi05LogProbOutput
+    from openpi.rl.pi05_types import Pi05RolloutOutput
 
 Pi05TrainableScope = Literal[
     "rl_heads_only",
@@ -73,6 +72,11 @@ class Pi05AcceRLConfig:
 
 def create_adapter(cfg: Pi05AcceRLConfig, device: str = "cpu") -> Pi05LiberoRLAdapter:
     """Create the shared LIBERO transform/checkpoint adapter."""
+
+    # Import inside the Ray worker. Importing OpenPI's model/config stack in
+    # the driver initializes JAX, which can crash Ray when the first actor is
+    # submitted on some systems.
+    from openpi.rl.libero_adapter import Pi05LiberoRLAdapter
 
     return Pi05LiberoRLAdapter(
         train_config_name=cfg.train_config_name,
@@ -200,6 +204,10 @@ def build_pi05_rl_heads(
 ) -> Pi05NestedMDP:
     """Attach the stochastic denoising head and outer-MDP value head."""
 
+    from openpi.rl.pi05_action_head import Pi05GaussianActionHead
+    from openpi.rl.pi05_nested_mdp import Pi05NestedMDP
+    from openpi.rl.pi05_nested_mdp import Pi05NestedMDPConfig
+
     if cfg.sample_method == "flow_noise":
         if hasattr(model, "rl_action_head"):
             raise ValueError("model.rl_action_head already exists; refusing to replace a loaded RL head")
@@ -248,6 +256,8 @@ def check_pi05_action_contract(
     nested_mdp: Pi05NestedMDP | None = None,
 ) -> None:
     """Validate the checkpoint, transforms, action shapes, and denoising policy contract."""
+
+    from openpi.rl.pi05_action_head import Pi05GaussianActionHead
 
     if not getattr(model, "pi05", False):
         raise ValueError("AcceRL pi0.5 requires a model constructed with pi05=True")
@@ -360,6 +370,8 @@ def observation_to_cpu(
     observation: model_types.Observation[torch.Tensor],
 ) -> model_types.Observation[torch.Tensor]:
     """Detach an Observation before it crosses a Ray object-store boundary."""
+
+    from openpi.models import model as model_types
 
     def convert(value: Any) -> Any:
         if isinstance(value, dict):

@@ -7,7 +7,6 @@ import os
 import torch
 import torch.distributed as dist
 from torch.distributed import Backend
-import deepspeed
 import contextlib
 
 
@@ -225,6 +224,10 @@ class TrainerActorCom:
 
     def broadcast_weights(self, group_name, prefix=None):
         # 只在 src=0 的 Trainer 调用（你的主循环里就是这样）
+        # DeepSpeed 只属于 Trainer 路径，避免独立 LIBERO worker
+        # 在 rlinf 环境加载本模块时初始化 DeepSpeed。
+        import deepspeed
+
         group_handle = _group_mgr.get_group_by_name(group_name)
         assert group_handle is not None, f"广播组 '{group_name}' 未初始化"
 

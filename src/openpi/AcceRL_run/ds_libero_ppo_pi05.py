@@ -21,16 +21,16 @@ from datetime import datetime
 import json
 import os
 from pathlib import Path
+import random
 import socket
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 os.environ.setdefault("MUJOCO_GL", "osmesa")
 os.environ.setdefault("PYOPENGL_PLATFORM", "osmesa")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("RAY_DEDUP_LOGS", "0")
 
-import deepspeed
 import numpy as np
 from pi05_ds_com import InferenceActorCom
 from pi05_ds_com import TrainerActorCom
@@ -48,10 +48,12 @@ import ray
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
-from openpi.models import model as model_types
 from openpi.rl.pi05_denoising import normal_entropy
 from openpi.rl.pi05_losses import compute_pi05_ppo_loss
 from openpi.rl.pi05_losses import compute_value_loss
+
+if TYPE_CHECKING:
+    from openpi.models import model as model_types
 
 
 def parse_args() -> argparse.Namespace:
@@ -92,6 +94,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-trainer-gpus", type=int, default=1)
     parser.add_argument("--num-inference-actors", type=int, default=1)
     parser.add_argument("--num-rollout-workers", type=int, default=1)
+    parser.add_argument(
+        "--rollout-python",
+        default=str(workspace_root / "clone_env_smoke_test" / "rlinf_env" / "bin" / "python"),
+        help="Python executable used by LIBERO RolloutWorkerActor processes.",
+    )
     parser.add_argument("--inference-batch", type=int, default=8)
     parser.add_argument("--inference-timeout-ms", type=int, default=10)
     parser.add_argument("--num-cpus", type=int, default=None)
@@ -213,38 +220,36 @@ class StatsActor:
 
 @ray.remote
 class ReplayBufferActor:
-    """FIFO trajectory queue measured in outer environment decisions."""
+    """Trajectory replay buffer following the original AcceRL sampling semantics."""
 
     def __init__(self, capacity: int):
-        self.capacity = int(capacity)
-        self.trajectories: deque[Trajectory] = deque()
-        self.step_count = 0
+        # Keep capacity in trajectories, matching ds_libero_ppo_discrete.py.
+        self.trajectories: deque[Trajectory] = deque(maxlen=int(capacity))
 
     def add_trajectory(self, trajectory: Trajectory) -> None:
         if trajectory.num_steps <= 0:
             return
         self.trajectories.append(trajectory)
-        self.step_count += trajectory.num_steps
-        while self.step_count > self.capacity and len(self.trajectories) > 1:
-            removed = self.trajectories.popleft()
-            self.step_count -= removed.num_steps
 
     def total_steps(self) -> int:
-        return self.step_count
+        return sum(trajectory.num_steps for trajectory in self.trajectories)
 
     def size(self) -> int:
         return len(self.trajectories)
 
     def sample_trajectories(self, minimum_steps: int) -> list[Trajectory]:
-        if self.step_count < minimum_steps:
-            raise RuntimeError(f"Replay queue has {self.step_count} steps, needs {minimum_steps}")
+        if not self.trajectories:
+            return []
         selected: list[Trajectory] = []
         selected_steps = 0
-        while self.trajectories and selected_steps < minimum_steps:
-            trajectory = self.trajectories.popleft()
+        indices = list(range(len(self.trajectories)))
+        random.shuffle(indices)
+        for index in indices:
+            trajectory = self.trajectories[index]
             selected.append(trajectory)
             selected_steps += trajectory.num_steps
-            self.step_count -= trajectory.num_steps
+            if selected_steps >= minimum_steps:
+                break
         return selected
 
 
@@ -382,6 +387,22 @@ class InferenceActor(InferenceActorCom):
         super().receive_and_update_weights(group_name)
         self.policy_version += 1
 
+    def align_broadcast_dtypes(self, trainer_signature: list[tuple[str, str, tuple[int, ...], str]]) -> None:
+        """Match inference parameter dtypes after DeepSpeed applies BF16 casting."""
+
+        parameters = dict(self.model.named_parameters(recurse=True))
+        for tensor_kind, name, shape, dtype_name in trainer_signature:
+            if tensor_kind != "param":
+                continue
+            parameter = parameters.get(name)
+            if parameter is None or tuple(parameter.shape) != tuple(shape):
+                raise RuntimeError(f"Inference broadcast parameter does not match Trainer: {name}")
+            dtype = getattr(torch, dtype_name.removeprefix("torch."), None)
+            if not isinstance(dtype, torch.dtype):
+                raise TypeError(f"Unsupported Trainer broadcast dtype: {dtype_name}")
+            if parameter.dtype != dtype:
+                parameter.data = parameter.data.to(dtype=dtype)
+
     def get_model_summary(self) -> dict[str, Any]:
         return {
             "parameters": sum(parameter.numel() for parameter in self.model.parameters()),
@@ -477,14 +498,24 @@ class RolloutWorkerActor:
                 observation = next_observation
                 episode_done = terminated or truncated or episode_length >= self.max_episode_steps
 
-                if len(segment) >= self.rollout_local_buf or episode_done:
-                    if episode_done:
-                        bootstrap_value = 0.0
-                    else:
-                        next_model_observation = prepare_one_obs(self.adapter, observation, self.task_description)
-                        bootstrap_value = ray.get(self.inference_actor.value.remote(next_model_observation))
-                    self.replay_buffer.add_trajectory.remote(_pack_trajectory(segment, bootstrap_value, episode_done))
+                if episode_done:
+                    self.replay_buffer.add_trajectory.remote(
+                        _pack_trajectory(segment, bootstrap_value=0.0, is_terminal=True)
+                    )
                     segment = []
+                elif len(segment) == self.rollout_local_buf + 1:
+                    # Match the original AcceRL overlap rule: the newest sample's
+                    # rollout value bootstraps the preceding segment, then that
+                    # sample is retained as the first item of the next segment.
+                    bootstrap_value = float(segment[-1]["old_value"])
+                    self.replay_buffer.add_trajectory.remote(
+                        _pack_trajectory(
+                            segment[:-1],
+                            bootstrap_value=bootstrap_value,
+                            is_terminal=False,
+                        )
+                    )
+                    segment = [segment[-1]]
 
                 if episode_done:
                     break
@@ -564,6 +595,8 @@ class TrainerActor(TrainerActorCom):
         return ray.util.get_node_ip_address()
 
     def setup_deepspeed_group(self, master_addr: str, master_port: int) -> dict[str, int]:
+        import deepspeed
+
         os.environ["RANK"] = str(self.rank)
         os.environ["WORLD_SIZE"] = str(self.world_size)
         os.environ["MASTER_ADDR"] = master_addr
@@ -774,6 +807,11 @@ def _validate_first_version_args(args: argparse.Namespace) -> None:
         raise ValueError("train_batch_size and accumulation_steps must be positive")
     if args.rollout_local_buf <= 0:
         raise ValueError("rollout_local_buf must be positive")
+    rollout_python = Path(args.rollout_python)
+    if not rollout_python.is_file():
+        raise FileNotFoundError(f"Rollout Python executable not found: {rollout_python}")
+    if not os.access(rollout_python, os.X_OK):
+        raise PermissionError(f"Rollout Python is not executable: {rollout_python}")
 
 
 def main(args: argparse.Namespace) -> None:
@@ -848,6 +886,7 @@ def main(args: argparse.Namespace) -> None:
     trainer_summary = ray.get(trainer.setup_deepspeed_group.remote(master_addr, train_port))
 
     trainer_signature = ray.get(trainer.get_broadcast_signature.remote())
+    ray.get(inference_actor.align_broadcast_dtypes.remote(trainer_signature))
     inference_signature = ray.get(inference_actor.get_broadcast_signature.remote())
     if trainer_signature != inference_signature:
         first_mismatch = next(
@@ -864,13 +903,16 @@ def main(args: argparse.Namespace) -> None:
             f"first_mismatch={first_mismatch}"
         )
 
-    sanity_jobs = []
     for dtype_name in ("float32", "bfloat16", "int64"):
-        sanity_jobs.extend(
-            actor.broadcast_sanity_check.remote(args.broadcast_group_name, dtype_name, 8)
-            for actor in broadcast_participants
+        # Every NCCL rank must enter collectives in the same order. Submit one
+        # dtype round at a time because Ray async actors may otherwise reorder
+        # the independently queued calls.
+        ray.get(
+            [
+                actor.broadcast_sanity_check.remote(args.broadcast_group_name, dtype_name, 8)
+                for actor in broadcast_participants
+            ]
         )
-    ray.get(sanity_jobs)
     ray.get(
         [
             trainer.broadcast_weights.remote(args.broadcast_group_name),
@@ -878,8 +920,9 @@ def main(args: argparse.Namespace) -> None:
         ]
     )
 
+    rollout_runtime_env = {"py_executable": str(Path(args.rollout_python).resolve())}
     rollout_workers = [
-        RolloutWorkerActor.remote(
+        RolloutWorkerActor.options(runtime_env=rollout_runtime_env).remote(
             inference_actor=inference_actor,
             replay_buffer=replay_buffer,
             stats_actor=stats_actor,
@@ -894,7 +937,8 @@ def main(args: argparse.Namespace) -> None:
         )
         for worker_id in range(args.num_rollout_workers)
     ]
-    rollout_jobs = [worker.run.remote() for worker in rollout_workers]
+    for worker in rollout_workers:
+        worker.run.remote()
     print(
         f"AcceRL pi0.5 started: trainer={trainer_summary}, workers={len(rollout_workers)}, log_dir={log_dir}",
         flush=True,
@@ -931,8 +975,8 @@ def main(args: argparse.Namespace) -> None:
             if global_step > 0 and global_step % args.ckpt_every_steps == 0:
                 ray.get(trainer.save_checkpoint.remote(args.ckpt_dir, global_step))
     finally:
-        for job in rollout_jobs:
-            ray.cancel(job, force=True)
+        for worker in rollout_workers:
+            ray.kill(worker, no_restart=True)
         writer.close()
         ray.shutdown()
 
